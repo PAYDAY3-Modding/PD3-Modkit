@@ -1,0 +1,39 @@
+{
+    "FileVersion": 3,
+    "Version": 2,
+    "VersionName": "1.0.0",
+    "FriendlyName": "CrimeForge",
+    "Description": "A PAYDAY 3 modding toolkit for creating, importing, validating, packaging, and deploying mods.",
+    "Category": "Modding",
+    "CreatedBy": "Nadz",
+    "CreatedByURL": "",
+    "DocsURL": "",
+    "MarketplaceURL": "",
+    "SupportURL": "",
+    "EnabledByDefault": true,
+    "CanContainContent": false,
+    "IsBetaVersion": false,
+    "IsExperimentalVersion": false,
+    "Installed": false,
+    "Modules": [
+        {
+            "Name": "CrimeForge",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "PluginBrowser",
+            "Enabled": true
+        },
+        {
+            "Name": "PluginUtils",
+            "Enabled": true
+        },
+        {
+            "Name": "EditorScriptingUtilities",
+            "Enabled": true
+        }
+    ]
+}
