@@ -20,7 +20,7 @@ namespace CrimeForge.Automation
 		public bool CopyToGameDirectory;
 		public bool StartGame;
 		public string GameDirectory;
-		public string LaunchGameURL;
+		public string LaunchGameType;
 	}
 
 	internal sealed class CrimeForgePALPackagingManifest
@@ -228,9 +228,323 @@ namespace CrimeForge.Automation
 		private const string ModDeployRoot = "Mods";
 		private const string DefaultBaseReleaseVersion = "SOMERELEASE1";
 
-		private static string GetGameLaunchURL()
+		private static string NormalizeLaunchGameType(
+			string launchGameType)
 		{
-			return $"steam://rungameid/{SteamAppId}";
+			if (string.IsNullOrWhiteSpace(launchGameType))
+			{
+				// Backwards compatibility with older CrimeForge editor builds that
+				// only supplied -LaunchGame and implicitly meant Steam.
+				return "Steam";
+			}
+
+			if (launchGameType.Equals(
+					"Steam",
+					StringComparison.OrdinalIgnoreCase))
+			{
+				return "Steam";
+			}
+
+			if (launchGameType.Equals(
+					"MicrosoftStore",
+					StringComparison.OrdinalIgnoreCase) ||
+				launchGameType.Equals(
+					"Xbox",
+					StringComparison.OrdinalIgnoreCase))
+			{
+				return "MicrosoftStore";
+			}
+
+			if (launchGameType.Equals(
+					"Epic",
+					StringComparison.OrdinalIgnoreCase) ||
+				launchGameType.Equals(
+					"EpicGames",
+					StringComparison.OrdinalIgnoreCase))
+			{
+				return "Epic";
+			}
+
+			throw new AutomationException(
+				"Invalid -LaunchGameType '{0}'. Expected Steam, MicrosoftStore, or Epic.",
+				launchGameType
+			);
+		}
+
+		private static string FindEpicPAYDAY3LaunchURL()
+		{
+			var manifestsDirectory =
+				Path.Combine(
+					Environment.GetFolderPath(
+						Environment.SpecialFolder.CommonApplicationData),
+					"Epic",
+					"EpicGamesLauncher",
+					"Data",
+					"Manifests"
+				);
+
+			if (!Directory.Exists(manifestsDirectory))
+			{
+				return null;
+			}
+
+			foreach (var manifestFile in
+			         Directory.EnumerateFiles(
+				         manifestsDirectory,
+				         "*.item",
+				         SearchOption.TopDirectoryOnly))
+			{
+				try
+				{
+					using var document =
+						JsonDocument.Parse(
+							File.ReadAllText(manifestFile));
+
+					var root = document.RootElement;
+
+					if (!root.TryGetProperty(
+							"DisplayName",
+							out var displayNameElement))
+					{
+						continue;
+					}
+
+					var displayName =
+						displayNameElement.GetString() ?? "";
+
+					if (!displayName.Equals(
+							"PAYDAY 3",
+							StringComparison.OrdinalIgnoreCase))
+					{
+						continue;
+					}
+
+					string catalogNamespace =
+						root.TryGetProperty(
+							"CatalogNamespace",
+							out var namespaceElement)
+							? namespaceElement.GetString()
+							: null;
+
+					string catalogItemId =
+						root.TryGetProperty(
+							"CatalogItemId",
+							out var catalogElement)
+							? catalogElement.GetString()
+							: null;
+
+					string appName =
+						root.TryGetProperty(
+							"AppName",
+							out var appElement)
+							? appElement.GetString()
+							: null;
+
+					if (!string.IsNullOrWhiteSpace(catalogNamespace) &&
+					    !string.IsNullOrWhiteSpace(catalogItemId) &&
+					    !string.IsNullOrWhiteSpace(appName))
+					{
+						return string.Format(
+							"com.epicgames.launcher://apps/{0}%3A{1}%3A{2}?action=launch&silent=true",
+							Uri.EscapeDataString(catalogNamespace),
+							Uri.EscapeDataString(catalogItemId),
+							Uri.EscapeDataString(appName)
+						);
+					}
+
+					// Epic still supports the legacy Artifact/AppName-only URI.
+					if (!string.IsNullOrWhiteSpace(appName))
+					{
+						return string.Format(
+							"com.epicgames.launcher://apps/{0}?action=launch&silent=true",
+							Uri.EscapeDataString(appName)
+						);
+					}
+				}
+				catch (Exception exception)
+				{
+					LogWarning(
+						"Could not inspect Epic manifest '{0}': {1}",
+						manifestFile,
+						exception.Message
+					);
+				}
+			}
+
+			return null;
+		}
+
+		private static string FindMicrosoftStorePAYDAY3Aumid()
+		{
+			try
+			{
+				var startInfo =
+					new ProcessStartInfo
+					{
+						FileName = "powershell.exe",
+						UseShellExecute = false,
+						RedirectStandardOutput = true,
+						RedirectStandardError = true,
+						CreateNoWindow = true
+					};
+
+				startInfo.ArgumentList.Add("-NoProfile");
+				startInfo.ArgumentList.Add("-NonInteractive");
+				startInfo.ArgumentList.Add("-Command");
+				startInfo.ArgumentList.Add(
+					"$app = Get-StartApps | " +
+					"Where-Object { $_.Name -like 'PAYDAY 3*' -and $_.AppID -like '*!*' } | " +
+					"Select-Object -First 1; " +
+					"if ($null -ne $app) { [Console]::Out.Write($app.AppID) }"
+				);
+
+				using var process = Process.Start(startInfo);
+				if (process == null)
+				{
+					return null;
+				}
+
+				var output = process.StandardOutput.ReadToEnd();
+				var error = process.StandardError.ReadToEnd();
+
+				process.WaitForExit(10000);
+
+				if (process.ExitCode != 0)
+				{
+					LogWarning(
+						"Microsoft Store/Xbox launch detection failed: {0}",
+						error.Trim()
+					);
+					return null;
+				}
+
+				return string.IsNullOrWhiteSpace(output)
+					? null
+					: output.Trim();
+			}
+			catch (Exception exception)
+			{
+				LogWarning(
+					"Microsoft Store/Xbox launch detection failed: {0}",
+					exception.Message
+				);
+				return null;
+			}
+		}
+
+		private static void LaunchDirectPAYDAY3Executable(
+			string gameDirectory)
+		{
+			var executable =
+				Path.Combine(
+					gameDirectory ?? "",
+					GameExecutableName
+				);
+
+			if (!File.Exists(executable))
+			{
+				throw new AutomationException(
+					"Unable to launch PAYDAY 3 directly. Expected '{0}'.",
+					executable
+				);
+			}
+
+			Process.Start(
+				new ProcessStartInfo(executable)
+				{
+					UseShellExecute = true,
+					WorkingDirectory = gameDirectory
+				}
+			);
+		}
+
+		private static void LaunchPAYDAY3(
+			PD3Params pd3Params)
+		{
+			var launchType =
+				NormalizeLaunchGameType(
+					pd3Params.LaunchGameType);
+
+			if (launchType == "Steam")
+			{
+				Process.Start(
+					new ProcessStartInfo(
+						$"steam://rungameid/{SteamAppId}")
+					{
+						UseShellExecute = true
+					}
+				);
+
+				return;
+			}
+
+			if (launchType == "Epic")
+			{
+				var epicLaunchURL =
+					FindEpicPAYDAY3LaunchURL();
+
+				if (!string.IsNullOrWhiteSpace(epicLaunchURL))
+				{
+					LogInformation(
+						"Launching PAYDAY 3 through Epic Games Launcher."
+					);
+
+					Process.Start(
+						new ProcessStartInfo(epicLaunchURL)
+						{
+							UseShellExecute = true
+						}
+					);
+
+					return;
+				}
+
+				LogWarning(
+					"PAYDAY 3 was not found in Epic's installed-game manifests. Falling back to GameDir/PAYDAY3.exe."
+				);
+
+				LaunchDirectPAYDAY3Executable(
+					pd3Params.GameDirectory);
+				return;
+			}
+
+			if (launchType == "MicrosoftStore")
+			{
+				var aumid =
+					FindMicrosoftStorePAYDAY3Aumid();
+
+				if (!string.IsNullOrWhiteSpace(aumid))
+				{
+					LogInformation(
+						"Launching PAYDAY 3 through Microsoft Store/Xbox app identity: {0}",
+						aumid
+					);
+
+					Process.Start(
+						new ProcessStartInfo(
+							"explorer.exe",
+							$"shell:AppsFolder\\\\{aumid}")
+						{
+							UseShellExecute = true
+						}
+					);
+
+					return;
+				}
+
+				LogWarning(
+					"PAYDAY 3 Microsoft Store/Xbox AUMID could not be detected. Falling back to GameDir/PAYDAY3.exe."
+				);
+
+				LaunchDirectPAYDAY3Executable(
+					pd3Params.GameDirectory);
+				return;
+			}
+
+			throw new AutomationException(
+				"Unsupported PAYDAY 3 launch type '{0}'.",
+				launchType
+			);
 		}
 
 		private static int GetRequestedChunkId(BuildCommand cmd)
@@ -2748,15 +3062,12 @@ namespace CrimeForge.Automation
 				{
 					GameDirectory = gameDir,
 					StartGame = ParseParam("LaunchGame"),
+					LaunchGameType =
+						ParseOptionalStringParam(
+							"LaunchGameType"),
 					CopyToGameDirectory =
 						ParseParam("CopyToGameDir")
 				};
-
-				if (pd3Params.StartGame)
-				{
-					pd3Params.LaunchGameURL =
-						GetGameLaunchURL();
-				}
 
 				if (chunkId >= 0)
 				{
@@ -2787,19 +3098,17 @@ namespace CrimeForge.Automation
 					);
 				}
 
-				if (pd3Params.StartGame &&
-				    !string.IsNullOrWhiteSpace(
-					    pd3Params.LaunchGameURL))
+				if (pd3Params.StartGame)
 				{
 					result.SetPhase("Launch PAYDAY 3");
 
-					Process.Start(
-						new ProcessStartInfo(
-							pd3Params.LaunchGameURL)
-						{
-							UseShellExecute = true
-						}
+					LogInformation(
+						"Launching PAYDAY 3 after packaging. Store={0}",
+						NormalizeLaunchGameType(
+							pd3Params.LaunchGameType)
 					);
+
+					LaunchPAYDAY3(pd3Params);
 				}
 
 				result.SetPhase("Completed");

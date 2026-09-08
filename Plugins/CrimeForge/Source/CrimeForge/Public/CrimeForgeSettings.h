@@ -6,8 +6,10 @@
 
 UENUM()
 enum class ECrimeForgeStartGameType : uint8 {
-    NONE UMETA(DisplayName = "Do not launch"),
-    STEAM UMETA(DisplayName = "Steam"),
+    NONE = 0 UMETA(DisplayName = "Do not launch"),
+    STEAM = 1 UMETA(DisplayName = "Steam"),
+    MICROSOFT_STORE = 2 UMETA(DisplayName = "Microsoft Store / Xbox"),
+    EPIC_GAMES = 3 UMETA(DisplayName = "Epic Games Store"),
 };
 
 UCLASS(config=Game)

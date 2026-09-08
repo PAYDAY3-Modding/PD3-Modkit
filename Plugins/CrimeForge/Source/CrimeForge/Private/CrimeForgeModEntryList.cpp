@@ -14,59 +14,67 @@
 void SCrimeForgeModEntryList::Construct(const FArguments& Args) {
     ChildSlot[
         SNew(SVerticalBox)
+
+        // Selection actions. SWrapBox prevents these from being clipped when
+        // CrimeForge is docked into a narrow side panel.
         + SVerticalBox::Slot()
         .AutoHeight()
-        .Padding(FMargin(0.0f, 2.0f, 0.0f, 5.0f))
+        .Padding(FMargin(0.0f, 2.0f, 0.0f, 4.0f))
         [
-            SNew(SHorizontalBox)
+            SNew(SWrapBox)
+            .UseAllottedSize(true)
+            .InnerSlotPadding(FVector2D(3.0f, 3.0f))
 
-            + SHorizontalBox::Slot()
-            .AutoWidth()
-            .Padding(0.0f, 0.0f, 3.0f, 0.0f)
+            + SWrapBox::Slot()
             [
                 SNew(SButton)
                 .Text(LOCTEXT("PackageModCrimeForgeAll", "CrimeForge Selected!"))
                 .OnClicked(this, &SCrimeForgeModEntryList::PackageAllMods)
             ]
 
-            + SHorizontalBox::Slot()
-            .AutoWidth()
-            .Padding(0.0f, 0.0f, 3.0f, 0.0f)
+            + SWrapBox::Slot()
             [
                 SNew(SButton)
                 .Text(LOCTEXT("PackageModCheckAll", "Check All"))
                 .OnClicked(this, &SCrimeForgeModEntryList::CheckAllMods)
             ]
 
-            + SHorizontalBox::Slot()
-            .AutoWidth()
+            + SWrapBox::Slot()
             [
                 SNew(SButton)
                 .Text(LOCTEXT("PackageModUncheckAll", "Check None"))
                 .OnClicked(this, &SCrimeForgeModEntryList::UncheckAllMods)
             ]
+        ]
 
-            + SHorizontalBox::Slot()
-            .FillWidth(1.0f)
+        // Creation/import actions get their own responsive row so they remain
+        // reachable even at the narrow dock width shown in the side panel.
+        + SVerticalBox::Slot()
+        .AutoHeight()
+        .Padding(FMargin(0.0f, 0.0f, 0.0f, 5.0f))
+        [
+            SNew(SWrapBox)
+            .UseAllottedSize(true)
+            .InnerSlotPadding(FVector2D(3.0f, 3.0f))
 
-            + SHorizontalBox::Slot()
-            .AutoWidth()
-            .Padding(0.0f, 0.0f, 3.0f, 0.0f)
+            + SWrapBox::Slot()
             [
                 SNew(SButton)
                 .Text(LOCTEXT("ImportLegacyMod", "Import Legacy Mod"))
-                .ToolTipText(LOCTEXT("ImportLegacyModTooltip", "Migrate an uncooked UE4 ModLoader mod folder into a PDML/CrimeForge mod plugin."))
+                .ToolTipText(LOCTEXT(
+                    "ImportLegacyModTooltip",
+                    "Migrate an uncooked UE4 ModLoader mod folder into a PDML/CrimeForge mod plugin."))
                 .OnClicked(this, &SCrimeForgeModEntryList::ImportLegacyMod)
             ]
 
-            + SHorizontalBox::Slot()
-            .AutoWidth()
+            + SWrapBox::Slot()
             [
                 SNew(SButton)
                 .Text(LOCTEXT("CreateMod", "Create Mod"))
                 .OnClicked(this, &SCrimeForgeModEntryList::CreateMod)
             ]
         ]
+
         + SVerticalBox::Slot()
         .FillHeight(1.0f)
         .Padding(FMargin(0.0f, 1.0f, 0.0f, 0.0f))
@@ -74,7 +82,9 @@ void SCrimeForgeModEntryList::Construct(const FArguments& Args) {
             SNew(SScrollBox)
             .Orientation(Orient_Vertical)
             .ScrollBarAlwaysVisible(true)
-            + SScrollBox::Slot()[
+
+            + SScrollBox::Slot()
+            [
                 SAssignNew(ModGrid, SWrapBox)
                 .UseAllottedSize(true)
                 .InnerSlotPadding(FVector2D(4.0f, 4.0f))
@@ -84,7 +94,9 @@ void SCrimeForgeModEntryList::Construct(const FArguments& Args) {
     ];
 
     LoadMods();
-    IPluginManager::Get().OnNewPluginCreated().AddSP(this, &SCrimeForgeModEntryList::OnNewPluginCreated);
+    IPluginManager::Get().OnNewPluginCreated().AddSP(
+        this,
+        &SCrimeForgeModEntryList::OnNewPluginCreated);
 }
 
 bool DoesPluginHaveRuntime(const IPlugin& Plugin) {

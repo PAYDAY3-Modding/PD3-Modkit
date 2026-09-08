@@ -3076,8 +3076,24 @@ FReply SCrimeForgeModEntry::OnEditModFinished(UModMetadataObject* MetadataObject
 	return FReply::Handled();
 }
 
-FString GetArgumentForLaunchType(ECrimeForgeStartGameType LaunchMode) {
-	return TEXT("");
+FString GetArgumentForLaunchType(
+    ECrimeForgeStartGameType LaunchMode)
+{
+    switch (LaunchMode)
+    {
+    case ECrimeForgeStartGameType::STEAM:
+        return TEXT("-LaunchGameType=Steam");
+
+    case ECrimeForgeStartGameType::MICROSOFT_STORE:
+        return TEXT("-LaunchGameType=MicrosoftStore");
+
+    case ECrimeForgeStartGameType::EPIC_GAMES:
+        return TEXT("-LaunchGameType=Epic");
+
+    case ECrimeForgeStartGameType::NONE:
+    default:
+        return TEXT("");
+    }
 }
 
 FText GetCurrentPlatformName() {
