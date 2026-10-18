@@ -35,6 +35,7 @@
 !*.exp
 !*.manifest
 !*.bin
+!*.fib
 
 # Java source files
 !*.java

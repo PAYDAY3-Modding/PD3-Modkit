@@ -3,11 +3,14 @@
 #include "CoreMinimal.h"
 
 /**
- * Editor-side updater for the official PD3 Modkit Git repository.
+ * Editor-side updater for the official PD3 Modkit and compatible UE5-PD3 releases.
  *
- * Update checks use Git rather than the GitHub API, so the updater compares the
+ * Modkit checks use Git, so the updater compares the
  * current checkout with the official remote branch after a fetch. Uncommitted
  * working-tree changes do not affect version detection.
+ * Engine checks independently use the existing installer's authenticated GitHub CLI
+ * release catalogue and per-installation release metadata. Engine actions open the
+ * installer release page; engine files are never patched by this editor module.
  *
  * When the user accepts an update, Unreal saves dirty packages and launches a
  * visible PowerShell/WPF helper before closing. The helper waits for the editor
@@ -26,7 +29,7 @@ public:
     static void Shutdown();
 
     /**
-     * Check the canonical PD3 Modkit remote for updates.
+     * Check the canonical PD3 Modkit remote and compatible engine releases for updates.
      *
      * @param bUserInitiated When true, "up to date" and error messages are
      * shown to the user. Startup checks stay silent unless an update is found.

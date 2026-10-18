@@ -47,8 +47,20 @@ namespace PD3ModkitUpdater
     };
 
     static FTSTicker::FDelegateHandle StartupTickerHandle;
+    static FTSTicker::FDelegateHandle PresentationTickerHandle;
     static bool bCheckInProgress = false;
     static TAtomic<bool> bShuttingDown(false);
+
+    struct FPendingUpdatePresentation
+    {
+        FUpdateCheckResult Modkit;
+        FCrimeFactoryEngineUpdateResult Engine;
+        bool bUserInitiated = false;
+    };
+
+    // Read and written only on the game thread. Completing a task must not open
+    // native windows: tasks also execute inside subsystem waits and window setup.
+    static TOptional<FPendingUpdatePresentation> PendingCheckResult;
 
     static FString QuoteArgument(const FString& Value)
     {
@@ -698,6 +710,7 @@ namespace PD3ModkitUpdater
 
     static void PresentCheckResult(
         const FUpdateCheckResult& Result,
+        const FCrimeFactoryEngineUpdateResult& EngineResult,
         const bool bUserInitiated)
     {
         if (bShuttingDown.Load())
@@ -708,6 +721,7 @@ namespace PD3ModkitUpdater
         bCheckInProgress = false;
 
         FCrimeFactoryUpdatePresentation View;
+        View.Engine = EngineResult;
         View.Branch = Result.BranchName;
         View.Repository = Result.RepositoryRoot;
         View.CurrentCommit = ShortCommit(Result.LocalCommit);
@@ -719,7 +733,7 @@ namespace PD3ModkitUpdater
         switch (Result.State)
         {
         case EUpdateState::UpToDate:
-            if (!bUserInitiated) return;
+            if (!bUserInitiated && !EngineResult.bUpdateAvailable) return;
             View.Status = TEXT("Your modkit is up to date");
             View.Detail = TEXT("No official updates are waiting to be installed. Local commits and file changes are shown below.");
             break;
@@ -737,7 +751,7 @@ namespace PD3ModkitUpdater
         case EUpdateState::Error:
         default:
             UE_LOG(LogTemp, Warning, TEXT("PD3 Modkit update check failed: %s"), *Result.Error);
-            if (!bUserInitiated) return;
+            if (!bUserInitiated && !EngineResult.bUpdateAvailable) return;
             View.Status = TEXT("The update check could not finish");
             View.Severity = ECrimeFactoryPreflightSeverity::Error;
             View.Detail = Result.Error;
@@ -756,6 +770,16 @@ namespace PD3ModkitUpdater
             }
         }
     }
+    static bool TickPendingCheckResult(float DeltaTime)
+    {
+        if (bShuttingDown.Load()) return false;
+        if (!PendingCheckResult.IsSet() || !CrimeFactoryUpdaterUI::CanPresent()) return true;
+
+        FPendingUpdatePresentation ResultToPresent = MoveTemp(PendingCheckResult.GetValue());
+        PendingCheckResult.Reset();
+        PresentCheckResult(ResultToPresent.Modkit, ResultToPresent.Engine, ResultToPresent.bUserInitiated);
+        return !bShuttingDown.Load();
+    }
 }
 
 void FPD3ModkitUpdater::Initialize()
@@ -772,6 +796,8 @@ void FPD3ModkitUpdater::Initialize()
     StartupTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
         FTickerDelegate::CreateStatic(&FPD3ModkitUpdater::HandleStartupCheck),
         StartupCheckDelaySeconds);
+    PresentationTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateStatic(&TickPendingCheckResult));
 }
 
 void FPD3ModkitUpdater::Shutdown()
@@ -779,6 +805,13 @@ void FPD3ModkitUpdater::Shutdown()
     using namespace PD3ModkitUpdater;
 
     bShuttingDown.Store(true);
+    PendingCheckResult.Reset();
+
+    if (PresentationTickerHandle.IsValid())
+    {
+        FTSTicker::GetCoreTicker().RemoveTicker(PresentationTickerHandle);
+        PresentationTickerHandle.Reset();
+    }
 
     if (StartupTickerHandle.IsValid())
     {
@@ -818,15 +851,25 @@ void FPD3ModkitUpdater::CheckForUpdates(const bool bUserInitiated)
     }
 
     bCheckInProgress = true;
+    const FCrimeFactoryEngineUpdateSettings EngineSettings = FCrimeFactoryEngineUpdateSettings::Read();
 
-    Async(EAsyncExecution::ThreadPool, [bUserInitiated]()
+    Async(EAsyncExecution::ThreadPool, [bUserInitiated, EngineSettings]()
     {
+        // Start independently so a failed Git repository check cannot skip engine detection.
+        auto EngineCheck = Async(EAsyncExecution::ThreadPool, [EngineSettings]()
+        {
+            return CrimeFactoryEngineUpdater::Check(EngineSettings);
+        });
         const PD3ModkitUpdater::FUpdateCheckResult Result =
             PD3ModkitUpdater::PerformUpdateCheck();
+        const FCrimeFactoryEngineUpdateResult EngineResult = EngineCheck.Get();
 
-        AsyncTask(ENamedThreads::GameThread, [Result, bUserInitiated]()
+        AsyncTask(ENamedThreads::GameThread, [Result, EngineResult, bUserInitiated]()
         {
-            PD3ModkitUpdater::PresentCheckResult(Result, bUserInitiated);
+            if (!bShuttingDown.Load())
+            {
+                PendingCheckResult.Emplace(FPendingUpdatePresentation{Result, EngineResult, bUserInitiated});
+            }
         });
     });
 }

@@ -116,7 +116,7 @@ void FCrimeFactoryModule::StartupModule() {
             Section.AddMenuEntry(
                 TEXT("PD3Modkit_CheckForUpdates"),
                 LOCTEXT("PD3ModkitCheckForUpdates", "Check for Modkit Updates"),
-                LOCTEXT("PD3ModkitCheckForUpdatesTooltip", "Check GitHub for a newer version of the PD3 Modkit."),
+                LOCTEXT("PD3ModkitCheckForUpdatesTooltip", "Check for PD3 Modkit and compatible UE5-PD3 engine updates."),
                 FSlateIcon(),
                 FUIAction(FExecuteAction::CreateLambda([]()
                 {
