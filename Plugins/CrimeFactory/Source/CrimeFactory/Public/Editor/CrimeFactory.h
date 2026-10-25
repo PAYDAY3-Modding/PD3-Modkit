@@ -44,6 +44,7 @@ private:
     void RegisterModTemplates();
     void AddModTemplatesFromPlugin(IPlugin& Plugin);
     bool RegisterPrimaryAssetLabelsFromPlugin(IPlugin& Plugin);
+    bool PruneDeletedModRegistrations();
     void SaveAndRefreshAssetManagerSettings();
     TArray<TSharedRef<struct FModTemplateDescription>> ModTemplates;
 };

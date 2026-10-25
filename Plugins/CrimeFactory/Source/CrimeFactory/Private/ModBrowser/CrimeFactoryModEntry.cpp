@@ -4535,6 +4535,12 @@ FReply SCrimeFactoryModEntry::OnDeleteMod()
 
     AssetRegistry.RemovePath(RegistryMountPath);
 
+    // Drop the saved and live Asset Manager references while the mount is
+    // still valid, before the cook configuration can reference an unmounted root.
+    FCrimeFactoryModule& CrimeFactoryModule =
+        FModuleManager::LoadModuleChecked<FCrimeFactoryModule>(TEXT("CrimeFactory"));
+    CrimeFactoryModule.RemoveAssetManagerRegistrationForPlugin(PluginName, PluginMountPath);
+
     /*
      * Remove the package mount itself. Content Browser listens to mount/path
      * changes, so this removes the deleted mod root from the Sources panel
@@ -4549,15 +4555,6 @@ FReply SCrimeFactoryModEntry::OnDeleteMod()
     FPackageName::UnRegisterMountPoint(
         RootMountPath,
         PluginContentDir);
-
-    // Remove /<ModName> and any /<ModName>/... Specific Assets.
-    FCrimeFactoryModule& CrimeFactoryModule =
-        FModuleManager::LoadModuleChecked<FCrimeFactoryModule>(
-            TEXT("CrimeFactory"));
-
-    CrimeFactoryModule.RemoveAssetManagerRegistrationForPlugin(
-        PluginName,
-        PluginMountPath);
 
     // Remove the saved checkbox selection for the deleted mod.
     if (UCrimeFactorySettings* Settings = UCrimeFactorySettings::Get())

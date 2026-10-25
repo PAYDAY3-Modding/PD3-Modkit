@@ -12,6 +12,8 @@
 #include "Interfaces/IPluginManager.h"
 #include "HAL/PlatformFilemanager.h"
 #include "Misc/App.h"
+#include "Misc/PackageName.h"
+#include "Misc/ScopeExit.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"   
 #include "UObject/SavePackage.h"
@@ -26,13 +28,100 @@
 #include "UObject/UnrealType.h"
 #include "UObject/StructOnScope.h"
 #include "UObject/SoftObjectPtr.h"
+#include "UObject/ObjectRedirector.h"
+#include "UObject/StrongObjectPtr.h"
 #include "Engine/World.h"
+#include "ObjectTools.h"
 
 #define LOCTEXT_NAMESPACE "NewModWizard"
 
 
 namespace
 {
+	static void CleanupTemplateRedirectors(const FString& PluginContentPath)
+	{
+		IAssetRegistry& Registry =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		// Renaming and saving do not synchronously refresh the registry's disk data.
+		// Reconcile deleted packages too, including when no redirector was needed.
+		Registry.ScanPathsSynchronous({ PluginContentPath }, true);
+		TArray<FAssetData> Assets;
+		Registry.GetAssetsByPath(FName(*PluginContentPath), Assets, true);
+		TArray<TStrongObjectPtr<UObjectRedirector>> Redirectors;
+		TMap<FSoftObjectPath, FSoftObjectPath> RedirectMap;
+		for (const FAssetData& Data : Assets)
+		{
+			if (!Data.IsRedirector()) continue;
+			TArray<FString> Segments;
+			Data.PackageName.ToString().ParseIntoArray(Segments, TEXT("/"), true);
+			if (!Segments.ContainsByPredicate([](const FString& Segment)
+				{ return Segment.StartsWith(TEXT("PLACEHOLDER_")) && Segment.EndsWith(TEXT("MODNAME")); })) continue;
+			UObjectRedirector* Redirector = Cast<UObjectRedirector>(Data.GetAsset());
+			UObject* Destination = Redirector ? Redirector->DestinationObject : nullptr;
+			if (!Destination || Destination->IsA<UObjectRedirector>() ||
+				!Destination->GetOutermost()->GetName().StartsWith(PluginContentPath) ||
+				!FPackageName::DoesPackageExist(Destination->GetOutermost()->GetName())) continue;
+			Redirectors.Emplace(Redirector);
+			RedirectMap.Add(FSoftObjectPath(Redirector), FSoftObjectPath(Destination));
+			if (Destination->IsA<UBlueprint>())
+			{
+				const FString OldPath = Redirector->GetPathName();
+				const FString NewPath = Destination->GetPathName();
+				RedirectMap.Add(FSoftObjectPath(OldPath + TEXT("_C")), FSoftObjectPath(NewPath + TEXT("_C")));
+				RedirectMap.Add(
+					FSoftObjectPath(Redirector->GetOutermost()->GetName() + TEXT(".Default__") + Redirector->GetName() + TEXT("_C")),
+					FSoftObjectPath(Destination->GetOutermost()->GetName() + TEXT(".Default__") + Destination->GetName() + TEXT("_C")));
+			}
+		}
+		if (Redirectors.IsEmpty()) return;
+
+		// Limit automatic repair to this mod. Load hard references through the
+		// redirectors, explicitly rewrite soft references, then persist both.
+		TArray<UObject*> AssetsToSave;
+		TArray<UPackage*> PackagesToFix;
+		for (const FAssetData& Data : Assets)
+		{
+			if (Data.IsRedirector() || !FPackageName::DoesPackageExist(Data.PackageName.ToString())) continue;
+			UObject* Asset = Data.GetAsset();
+			if (!Asset)
+			{
+				UE_LOG(LogCrimeFactory, Error, TEXT("Cannot load %s; retaining template redirectors."), *Data.GetObjectPathString());
+				return;
+			}
+			AssetsToSave.Add(Asset);
+			PackagesToFix.AddUnique(Asset->GetOutermost());
+		}
+		FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get()
+			.RenameReferencingSoftObjectPaths(PackagesToFix, RedirectMap);
+		if (!UEditorAssetLibrary::SaveLoadedAssets(AssetsToSave, false))
+		{
+			UE_LOG(LogCrimeFactory, Error, TEXT("Could not save repaired template references under %s; retaining redirectors."), *PluginContentPath);
+			return;
+		}
+		Registry.ScanPathsSynchronous({ PluginContentPath }, true);
+		TArray<UObject*> UnreferencedRedirectors;
+		for (const TStrongObjectPtr<UObjectRedirector>& Redirector : Redirectors)
+		{
+			TArray<FName> Referencers;
+			Registry.GetReferencers(Redirector->GetOutermost()->GetFName(), Referencers,
+				UE::AssetRegistry::EDependencyCategory::Package);
+			if (Referencers.IsEmpty())
+			{
+				UnreferencedRedirectors.Add(Redirector.Get());
+			}
+			else
+			{
+				UE_LOG(LogCrimeFactory, Warning, TEXT("Retaining template redirector %s: %d package(s) still reference it."),
+					*Redirector->GetPathName(), Referencers.Num());
+			}
+		}
+		Redirectors.Reset();
+		// Use Unreal's checked asset deletion so registry and package state are
+		// updated together. Never delete .uasset files directly.
+		if (!UnreferencedRedirectors.IsEmpty()) ObjectTools::DeleteObjects(UnreferencedRedirectors, false);
+		Registry.ScanPathsSynchronous({ PluginContentPath }, true);
+	}
+
 	static bool EnsurePDMLDependencyInUPlugin(
 		const FString& PluginDescriptorFileName,
 		const FString& PluginName)
@@ -1971,6 +2060,22 @@ void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName
 		PathsToScan,
 		true // bForceRescan
 	);
+	// AssetTools rejects renames while any asset discovery is still running,
+	// even after this plugin's own directory has been scanned synchronously.
+	AssetRegistry.WaitForCompletion();
+	if (AssetRegistry.IsLoadingAssets())
+	{
+		UE_LOG(LogCrimeFactory, Error, TEXT("Cannot rename template assets for %s while asset discovery is incomplete."), *PluginName);
+		return;
+	}
+	ON_SCOPE_EXIT
+	{
+		CleanupTemplateRedirectors(PluginContentPath);
+		// The content-mounted callback deliberately skips template PAL names.
+		// Persist the final PAL path only after renaming and redirector cleanup.
+		FModuleManager::GetModuleChecked<FCrimeFactoryModule>(TEXT("CrimeFactory"))
+			.EnsureAssetManagerRegistrationForPlugin(*Plugin);
+	};
 
 	TArray<FAssetData> AssetDataArray;
 	AssetRegistry.GetAssetsByPath(
@@ -2048,6 +2153,9 @@ void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName
 
 	for (const FAssetData& AssetData : AssetDataArray)
 	{
+		// A retry can encounter redirectors left by an earlier rename. They
+		// are cleanup candidates, not assets to rename onto their destinations.
+		if (AssetData.IsRedirector()) continue;
 		const FString OldName = AssetData.AssetName.ToString();
 		const FString OldPackagePath = AssetData.PackagePath.ToString();
 

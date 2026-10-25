@@ -1,13 +1,13 @@
 {
 	"FileVersion": 3,
 	"Version": 0,
-	"VersionName": "EA_0.1.0",
+	"VersionName": "EA_0.1.2",
 	"FriendlyName": "PDML",
 	"Description": "A unified PAYDAY 3 mod loader and runtime for managing Blueprint mods, custom maps, HUD mods, and their assets.",
 	"Category": "Modding",
 	"CreatedBy": "Nadz",
-	"CreatedByURL": "",
-	"DocsURL": "",
+	"CreatedByURL": "https://modworkshop.net/user/shalashaska1",
+	"DocsURL": "https://payday3-modding.github.io/Documentation/payday3-modding/index.html",
 	"MarketplaceURL": "",
 	"SupportURL": "",
 	"CanContainContent": true,
@@ -15,6 +15,12 @@
 	"IsExperimentalVersion": false,
 	"Installed": false,
 	"EnabledByDefault": true,
-	"SemVersion": "EA_0.1.0",
-	"RequiredOnRemote": false
+	"SemVersion": "EA_0.1.2",
+	"RequiredOnRemote": false,
+	"ModPageURL": "",
+	"ModEnvironment": "",
+	"ModLoaderVersion": "",
+	"ModAuthors": [
+		"Nadz"
+	]
 }

@@ -1,7 +1,10 @@
 #include "AssetPalette/SCrimeFactoryPaletteTile.h"
 
 #include "AssetThumbnail.h"
+#include "Fonts/FontMeasure.h"
+#include "Framework/Application/SlateApplication.h"
 #include "InputCoreTypes.h"
+#include "Rendering/SlateRenderer.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Layout/SBox.h"
@@ -11,6 +14,8 @@
 void SCrimeFactoryPaletteTile::Construct(const FArguments& Args, const TSharedRef<STableViewBase>& Owner)
 {
     const auto Item = Args._Item;
+    const FSlateFontInfo NameFont = FAppStyle::GetFontStyle("NormalFont");
+    const float NameHeight = 3.0f * FSlateApplication::Get().GetRenderer()->GetFontMeasureService()->GetMaxCharacterHeight(NameFont);
     TSharedRef<SWidget> Image = SNew(SImage).Image(FAppStyle::GetBrush(
         !Item->Problem.IsEmpty() ? "Icons.WarningWithColor" : "ClassIcon.Actor"));
     const bool bActorPreview = CrimeFactoryActorThumbnails::ShouldUsePreview(Item->AssetData, Item->bClassEntry);
@@ -40,10 +45,13 @@ void SCrimeFactoryPaletteTile::Construct(const FArguments& Args, const TSharedRe
         + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
         [ SNew(SBox).WidthOverride(96).HeightOverride(96)[Image] ]
         + SVerticalBox::Slot().AutoHeight().Padding(0, 5, 0, 0)
-        [ SNew(STextBlock).Text(Item->Label).Justification(ETextJustify::Center)
-            .OverflowPolicy(ETextOverflowPolicy::Ellipsis) ]
+        [ SNew(SBox).MaxDesiredHeight(NameHeight).Clipping(EWidgetClipping::ClipToBounds)
+            [ SNew(STextBlock).Text(Item->Label).Font(NameFont).Justification(ETextJustify::Center)
+                .AutoWrapText(true).WrappingPolicy(ETextWrappingPolicy::AllowPerCharacterWrapping)
+                .OverflowPolicy(ETextOverflowPolicy::Ellipsis) ] ]
         + SVerticalBox::Slot().AutoHeight()
-        [ SNew(STextBlock).Text(Item->Problem.IsEmpty() ? Item->TypeLabel : Item->Problem)
+        [ SNew(STextBlock).Text(Item->Problem)
+            .Visibility(Item->Problem.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible)
             .Font(FAppStyle::GetFontStyle("SmallFont")).ColorAndOpacity(FSlateColor::UseSubduedForeground())
             .Justification(ETextJustify::Center).OverflowPolicy(ETextOverflowPolicy::Ellipsis) ]);
 }
