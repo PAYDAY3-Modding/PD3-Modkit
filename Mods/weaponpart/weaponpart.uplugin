@@ -1,0 +1,28 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "weaponpart",
+	"Description": "",
+	"Category": "Other",
+	"CreatedBy": "",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Plugins": [
+		{
+			"Name": "PDML",
+			"Enabled": true,
+			"SemVersion": "EA_0.1.2"
+		}
+	],
+	"EnabledByDefault": true,
+	"SemVersion": "1.0.0",
+	"ModEnvironment": "Client",
+	"ModLoaderVersion": "EA_0.1.2"
+}
