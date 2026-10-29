@@ -4,6 +4,7 @@
 #include "Settings/CrimeFactorySettings.h"
 #include "ModBrowser/CrimeFactoryWidget.h"
 #include "AssetPalette/CrimeFactoryAssetPalette.h"
+#include "AirNavigation/CrimeFactoryAirNavigation.h"
 #include "Updater/PD3ModkitUpdater.h"
 #include "Metadata/CrimeFactoryMetadataSync.h"
 #include "ContentBrowserModule.h"
@@ -99,6 +100,22 @@ void FCrimeFactoryModule::StartupModule() {
                     Tools.AddMenuEntryWithCommandList(FCrimeFactoryCommands::Get().OpenPluginWindow, Commands);
                     Tools.AddMenuEntryWithCommandList(FCrimeFactoryCommands::Get().OpenAssetPalette, Commands);
                 }));
+        }
+    }
+
+    // Register air-navigation generation alongside the level build commands.
+    {
+        FToolMenuOwnerScoped OwnerScoped(this);
+        UToolMenu* BuildMenu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.MainMenu.Build"));
+        if (BuildMenu)
+        {
+            FToolMenuSection& Section = BuildMenu->FindOrAddSection(TEXT("LevelEditorNavigation"));
+            Section.AddMenuEntry(
+                TEXT("CrimeFactory_BuildAirNavigationData"),
+                LOCTEXT("BuildAirNavigationData", "Build Air Navigation Data"),
+                LOCTEXT("BuildAirNavigationDataTooltip", "Generate Starbreeze octree navigation data and air navigation links for the authored level."),
+                FSlateIcon(),
+                FUIAction(FExecuteAction::CreateStatic(&CrimeFactoryAirNavigation::GenerateForEditorWorld)));
         }
     }
 
