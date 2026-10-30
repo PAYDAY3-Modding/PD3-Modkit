@@ -11,6 +11,7 @@ struct FDynamicClassGenerationContext
 {
     // Key is the path of the object
 	TSharedPtr<FJsonObject> GlobalObjectMap;
+    TSharedPtr<FJsonObject> MetadataOverrides;
     // Value is the class path of the class
     TMap<UClass*, FString> ClassesPendingConstruction;
     // Value is the object path of the class default object
@@ -61,6 +62,7 @@ public:
     virtual void ShutdownModule() override;
 
 private:
+    friend class FSuzieEnumMetadataTest;
     TSharedPtr<FUICommandList> PluginCommands;
     TSharedPtr<FSlateStyleSet> PluginStyle;
 

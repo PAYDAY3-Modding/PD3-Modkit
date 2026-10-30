@@ -1,4 +1,5 @@
 #include "SuziePlugin.h"
+#include "SuzieReflectionMetadata.h"
 #include "HeistAuthoring.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonReader.h"
@@ -1024,6 +1025,7 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     // Create class generation context
     FDynamicClassGenerationContext ClassGenerationContext;
     ClassGenerationContext.GlobalObjectMap = *Objects;
+    ClassGenerationContext.MetadataOverrides = SuzieReflectionMetadata::LoadOverrides();
 
     // Create classes, script structs and global delegate functions
     for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
@@ -3675,8 +3677,14 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
         if (EnumNameAndValueArray.Num() == 2)
         {
             const FString EnumConstantName = EnumNameAndValueArray[0]->AsString();
-            // TODO: Using numbers to represent enumeration values is not safe, large int64 values cannot be adequately represented as json double precision numbers
-            const int64 EnumConstantValue = EnumNameAndValueArray[1]->AsNumber();
+            // String values also allow future dumps to preserve int64 values beyond
+            // JSON double precision. Never replace explicit values with entry indices.
+            int64 EnumConstantValue = 0;
+            if (!EnumNameAndValueArray[1]->TryGetNumber(EnumConstantValue))
+            {
+                UE_LOG(LogSuzie, Error, TEXT("Invalid enum value for %s"), *EnumConstantName);
+                continue;
+            }
 
             EnumNames.Add({FName(*EnumConstantName), EnumConstantValue});
             bContainsFullyQualifiedNames |= EnumConstantName.Contains(TEXT("::"));
@@ -3699,6 +3707,7 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
 
     // We do not need to generate _MAX key because it will always be present in the enum definition
     NewEnum->SetEnums(EnumNames, EnumCppForm, EnumFlags, false);
+    SuzieReflectionMetadata::ApplyEnum(NewEnum, EnumDefinition, Context.MetadataOverrides);
     NewEnum->SetMetaData(TEXT("SuzieDynamicEnum"), TEXT("true"));
 
     // Mark all dynamic enums as blueprint types
@@ -4400,6 +4409,29 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         }
     }
 
+    SuzieReflectionMetadata::ApplyProperty(NewProperty, PropertyJson, Context.MetadataOverrides);
+    if (NewProperty->HasMetaData(TEXT("Bitmask")))
+    {
+        const FNumericProperty* Numeric = CastField<FNumericProperty>(NewProperty);
+        const FString EnumPath = NewProperty->GetMetaData(TEXT("BitmaskEnum"));
+        // Metadata changes only the stock Property Editor control, never the FProperty
+        // type, storage, flags, defaults, or enum values. Do not infer associations.
+        UEnum* MaskEnum = EnumPath.IsEmpty() ? nullptr : FindObject<UEnum>(nullptr, *EnumPath);
+        if (!MaskEnum && !EnumPath.IsEmpty() && Context.GlobalObjectMap->HasTypedField<EJson::Object>(EnumPath)
+            && Context.GlobalObjectMap->GetObjectField(EnumPath)->GetStringField(TEXT("type")) == TEXT("Enum"))
+        {
+            MaskEnum = FindOrCreateEnum(Context, EnumPath);
+        }
+        if (!Numeric || !Numeric->IsInteger() || CastField<FEnumProperty>(NewProperty)
+            || (CastField<FByteProperty>(NewProperty) && CastField<FByteProperty>(NewProperty)->Enum)
+            || (!EnumPath.IsEmpty() && !MaskEnum))
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("Ignoring invalid bitmask metadata on %s (enum '%s'); use a full enum object path"),
+                *NewProperty->GetPathName(), *EnumPath);
+            NewProperty->RemoveMetaData(TEXT("Bitmask"));
+            NewProperty->RemoveMetaData(TEXT("BitmaskEnum"));
+        }
+    }
     return NewProperty;
 }
 
