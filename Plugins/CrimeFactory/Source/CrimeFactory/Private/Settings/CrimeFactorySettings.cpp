@@ -1,6 +1,9 @@
 ﻿#include "Settings/CrimeFactorySettings.h"
 
 #include "Misc/ConfigCacheIni.h"
+#include "HAL/FileManager.h"
+#include "HAL/PlatformMisc.h"
+#include "Misc/Paths.h"
 #include "UObject/UnrealType.h"
 
 #if __has_include("PD3CookedEditorSettings.h")
@@ -35,6 +38,24 @@ namespace
         return Property && GConfig->GetString(Section, Name, Value, Filename)
             && Property->ImportText_InContainer(*Value, Settings, Settings, PPF_None) != nullptr;
     }
+}
+
+UCrimeFactorySettings::UCrimeFactorySettings()
+{
+    // Config loading follows construction, so saved paths always override detection.
+    auto DetectExecutable = [](const TCHAR* RelativePath, const TCHAR* DefaultPath)
+    {
+        for (const TCHAR* Variable : {TEXT("ProgramW6432"), TEXT("ProgramFiles"), TEXT("ProgramFiles(x86)")})
+        {
+            const FString Root = FPlatformMisc::GetEnvironmentVariable(Variable);
+            if (Root.IsEmpty()) continue;
+            const FString Candidate = FPaths::Combine(Root, RelativePath);
+            if (IFileManager::Get().FileExists(*Candidate)) return Candidate;
+        }
+        return FString(DefaultPath);
+    };
+    WinRARExecutablePath.FilePath = DetectExecutable(TEXT("WinRAR/WinRAR.exe"), TEXT("C:/Program Files/WinRAR/WinRAR.exe"));
+    SevenZipExecutablePath.FilePath = DetectExecutable(TEXT("7-Zip/7z.exe"), TEXT("C:/Program Files/7-Zip/7z.exe"));
 }
 
 UCrimeFactorySettings* UCrimeFactorySettings::Get()
@@ -136,3 +157,48 @@ void UCrimeFactorySettings::SaveSettings()
         GConfig->Flush(false, GEditorPerProjectIni);
     }
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCrimeFactoryArchiveSettingsTest,
+    "CrimeFactory.Archiving.SettingsPersistence",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCrimeFactoryArchiveSettingsTest::RunTest(const FString& Parameters)
+{
+    // Use a private config file; never modify the editor user's preferences.
+    const FString Filename = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir()
+        / TEXT("CrimeFactory") / (TEXT("ArchiveSettings_") + FGuid::NewGuid().ToString() + TEXT(".ini")));
+    // Unlike the registered user ini, a new private filename must be added first.
+    GConfig->Add(Filename, FConfigFile());
+    UCrimeFactorySettings* Settings = NewObject<UCrimeFactorySettings>();
+    Settings->WinRARExecutablePath.FilePath = TEXT("C:/Custom WinRAR/WinRAR.exe");
+    Settings->SevenZipExecutablePath.FilePath = TEXT("D:/Custom 7-Zip/7z.exe");
+    Settings->bCreateUtilityArchive = true;
+    Settings->ArchiveUtility = ECrimeFactoryArchiveUtility::SevenZip;
+    Settings->SaveConfig(CPF_Config, *Filename, GConfig, false);
+    GConfig->UnloadFile(Filename);
+    GConfig->LoadFile(Filename);
+
+    UCrimeFactorySettings* Reloaded = NewObject<UCrimeFactorySettings>();
+    Reloaded->LoadConfig(UCrimeFactorySettings::StaticClass(), *Filename);
+    TestEqual(TEXT("7-Zip selection reloads"), Reloaded->ArchiveUtility, ECrimeFactoryArchiveUtility::SevenZip);
+    TestTrue(TEXT("Archive opt-in reloads"), Reloaded->bCreateUtilityArchive);
+    TestEqual(TEXT("Custom WinRAR path reloads"), Reloaded->WinRARExecutablePath.FilePath, Settings->WinRARExecutablePath.FilePath);
+    TestEqual(TEXT("Custom 7-Zip path reloads"), Reloaded->SevenZipExecutablePath.FilePath, Settings->SevenZipExecutablePath.FilePath);
+
+    Reloaded->ArchiveUtility = ECrimeFactoryArchiveUtility::WinRAR;
+    Reloaded->SaveConfig(CPF_Config, *Filename, GConfig, false);
+    GConfig->UnloadFile(Filename);
+    GConfig->LoadFile(Filename);
+    // A fresh object models editor restart: config omits values equal to defaults.
+    UCrimeFactorySettings* Switched = NewObject<UCrimeFactorySettings>();
+    Switched->LoadConfig(UCrimeFactorySettings::StaticClass(), *Filename);
+    TestEqual(TEXT("Switch back to WinRAR reloads"), Switched->ArchiveUtility, ECrimeFactoryArchiveUtility::WinRAR);
+    TestEqual(TEXT("Switch retains 7-Zip path"), Switched->SevenZipExecutablePath.FilePath, Reloaded->SevenZipExecutablePath.FilePath);
+    GConfig->UnloadFile(Filename);
+    IFileManager::Get().Delete(*Filename);
+    return true;
+}
+#endif

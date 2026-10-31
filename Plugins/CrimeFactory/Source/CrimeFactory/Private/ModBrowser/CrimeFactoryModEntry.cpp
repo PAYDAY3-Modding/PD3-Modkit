@@ -538,6 +538,7 @@ namespace
 	FString ClassifyPackagingFailure(
 		const FCrimeFactoryUATResult& Result)
 	{
+        if (Result.Phase == TEXT("Archive mod")) return TEXT("Archiving");
         if (Result.Phase == TEXT("Export ZIP")) return TEXT("ZIP export");
 		const FString Combined =
 			Result.Phase +
@@ -642,6 +643,8 @@ namespace
 		const FString& Category,
 		const FCrimeFactoryUATResult& Result)
 	{
+        if (Category == TEXT("Archiving"))
+            return TEXT("Cooking and staging finished, but archiving failed. Check the selected utility and Executable Path in CrimeFactory Project Settings, destination permissions, disk space, and the archive command output. The standard ZIP may still be available in Saved/ArchivedPlugins.");
         if (Category == TEXT("ZIP export"))
             return TEXT("The normal ZIP remains in Saved/ArchivedPlugins. Check the Additional ZIP Export Folder in CrimeFactory settings, available disk space, permissions, and whether the destination ZIP is open in another application.");
 
@@ -2488,7 +2491,8 @@ namespace
 			TEXT("CrimeFactory.Automation.csproj"),
 			TEXT("CrimeFactory.Automation.csproj.props"),
 			TEXT("Packaging/PackagePlugin.cs"),
-            TEXT("Packaging/CrimeFactoryZipExport.cs")
+            TEXT("Packaging/CrimeFactoryZipExport.cs"),
+            TEXT("Packaging/CrimeFactoryArchive.cs")
 		};
 
 		for (const TCHAR* SourceFile : SourceFiles)
@@ -2525,7 +2529,8 @@ namespace
 			TEXT("CrimeFactory.Automation.csproj"),
 			TEXT("CrimeFactory.Automation.csproj.props"),
 			TEXT("Packaging/PackagePlugin.cs"),
-            TEXT("Packaging/CrimeFactoryZipExport.cs")
+            TEXT("Packaging/CrimeFactoryZipExport.cs"),
+            TEXT("Packaging/CrimeFactoryArchive.cs")
 		};
 
 		uint32 Fingerprint = 2166136261u;
@@ -4078,6 +4083,17 @@ void SCrimeFactoryModEntry::PackageMod(const TArray<TSharedPtr<SCrimeFactoryModE
         for (const auto& Item : Result.Items)
             Combined.Add(Item.Severity, Batch->Entries.Num() > 1 ? Name + TEXT(" - ") + Item.Message : Item.Message);
     }
+    const UCrimeFactorySettings* ArchiveSettings = UCrimeFactorySettings::Get();
+    if (ArchiveSettings->bCreateUtilityArchive)
+    {
+        const bool bSevenZip = ArchiveSettings->ArchiveUtility == ECrimeFactoryArchiveUtility::SevenZip;
+        const FString Executable = (bSevenZip ? ArchiveSettings->SevenZipExecutablePath : ArchiveSettings->WinRARExecutablePath).FilePath.TrimStartAndEnd();
+        if (Executable.IsEmpty() || Executable.Contains(TEXT("\"")) || Executable.Contains(TEXT("\r")) || Executable.Contains(TEXT("\n"))
+            || !FPaths::GetExtension(Executable).Equals(TEXT("exe"), ESearchCase::IgnoreCase)
+            || !IFileManager::Get().FileExists(*Executable))
+            Combined.Error(FString::Printf(TEXT("%s executable is missing or invalid: %s. Configure its Executable Path in CrimeFactory Project Settings."),
+                bSevenZip ? TEXT("7-Zip") : TEXT("WinRAR"), *Executable));
+    }
     const FString Export = UCrimeFactorySettings::Get()->ZipExportDirectory.Path.TrimStartAndEnd();
     if (!Export.IsEmpty())
     {
@@ -4133,6 +4149,27 @@ void SCrimeFactoryModEntry::PackageMod(const TArray<TSharedPtr<SCrimeFactoryModE
     }
 
     FString AdditionalUATArguments;
+    if (Settings->bCreateUtilityArchive)
+    {
+        const bool bSevenZip = Settings->ArchiveUtility == ECrimeFactoryArchiveUtility::SevenZip;
+        const FString Executable = (bSevenZip ? Settings->SevenZipExecutablePath : Settings->WinRARExecutablePath).FilePath.TrimStartAndEnd();
+        // Validate again: settings may have changed while the batch was cooking.
+        if (Executable.IsEmpty() || Executable.Contains(TEXT("\"")) || Executable.Contains(TEXT("\r")) || Executable.Contains(TEXT("\n"))
+            || !FPaths::GetExtension(Executable).Equals(TEXT("exe"), ESearchCase::IgnoreCase)
+            || !IFileManager::Get().FileExists(*Executable))
+        {
+            FCrimeFactoryPackagingFailure Failure;
+            Failure.PluginName = PluginName;
+            Failure.Phase = TEXT("Archive configuration");
+            Failure.Message = FString::Printf(TEXT("%s executable is missing or invalid: %s"), bSevenZip ? TEXT("7-Zip") : TEXT("WinRAR"), *Executable);
+            Failure.Suggestion = TEXT("Configure the selected utility's Executable Path in CrimeFactory Project Settings.");
+            CrimeFactoryPackagingUI::ShowFailure(Failure);
+            return;
+        }
+        AdditionalUATArguments += FString::Printf(TEXT("-CreateUtilityArchive -ArchiveUtility=%s -ArchiveExecutable=\"%s\" "),
+            bSevenZip ? TEXT("SevenZip") : TEXT("WinRAR"), *FPaths::ConvertRelativePathToFull(Executable));
+    }
+
     if (!Batch->ZipExportDirectory.IsEmpty())
         AdditionalUATArguments += FString::Printf(TEXT("-ZipExportDir=\"%s\" "), *Batch->ZipExportDirectory);
 

@@ -22,6 +22,9 @@ namespace CrimeFactory.Automation
 		public string GameDirectory;
 		public string LaunchGameType;
         public string ZipExportDirectory;
+        public bool CreateUtilityArchive;
+        public string ArchiveUtility = "WinRAR";
+        public string ArchiveExecutable;
 	}
 
 	internal sealed class CrimeFactoryPALPackagingManifest
@@ -2886,7 +2889,8 @@ namespace CrimeFactory.Automation
 			ProjectParams dlcParams,
 			string workingPluginDirectory,
 			string pluginName,
-			string finalCookPlatform)
+			string finalCookPlatform,
+            PD3Params pd3Params)
 		{
 			var baseArchiveDirectory = CombinePaths(
 				Path.GetDirectoryName(
@@ -2917,11 +2921,20 @@ namespace CrimeFactory.Automation
 				zipFilePath
 			);
 
+            CreateUtilityArchive(workingPluginDirectory, zipFilePath, pd3Params);
+
 			LogInformation(
 				"Archived two-stage plugin: {0}",
 				zipFilePath
 			);
 		}
+
+        private static void CreateUtilityArchive(string source, string zipPath, PD3Params settings)
+        {
+            if (!settings.CreateUtilityArchive) return;
+            CrimeFactoryArchive.Create(source, Path.ChangeExtension(zipPath, CrimeFactoryArchive.Extension(settings.ArchiveUtility)),
+                settings.ArchiveUtility, settings.ArchiveExecutable, message => LogInformation("{0}", message));
+        }
 
         private static void ExportArchivedZip(ProjectParams projectParams, PD3Params pd3Params,
             string platform, string pluginName)
@@ -2960,7 +2973,8 @@ namespace CrimeFactory.Automation
 
 		private static void ArchivePluginProject(
 			ProjectParams projectParams,
-			IEnumerable<DeploymentContext> deploymentContexts)
+			IEnumerable<DeploymentContext> deploymentContexts,
+            PD3Params pd3Params)
 		{
 			var baseArchiveDirectory = CombinePaths(
 				Path.GetDirectoryName(
@@ -3004,6 +3018,7 @@ namespace CrimeFactory.Automation
 					stagePluginDirectory,
 					zipFilePath
 				);
+                CreateUtilityArchive(stagePluginDirectory, zipFilePath, pd3Params);
 			}
 		}
 
@@ -3125,7 +3140,8 @@ namespace CrimeFactory.Automation
 				result.SetPhase("Archive mod");
 				ArchivePluginProject(
 					projectParams,
-					deploymentContexts
+					deploymentContexts,
+                    pd3Params
 				);
 
                 if (!string.IsNullOrWhiteSpace(pd3Params.ZipExportDirectory))
@@ -3593,7 +3609,8 @@ namespace CrimeFactory.Automation
 					dlcParams,
 					workingPluginDirectory,
 					pluginName,
-					finalCookPlatform
+					finalCookPlatform,
+                    pd3Params
 				);
 
                 if (!string.IsNullOrWhiteSpace(pd3Params.ZipExportDirectory))
@@ -3690,6 +3707,9 @@ namespace CrimeFactory.Automation
 						ParseOptionalStringParam(
 							"LaunchGameType"),
                     ZipExportDirectory = ParseOptionalStringParam("ZipExportDir"),
+                    CreateUtilityArchive = ParseParam("CreateUtilityArchive"),
+                    ArchiveUtility = ParseOptionalStringParam("ArchiveUtility") ?? "WinRAR",
+                    ArchiveExecutable = ParseOptionalStringParam("ArchiveExecutable"),
 					CopyToGameDirectory =
 						ParseParam("CopyToGameDir")
 				};
