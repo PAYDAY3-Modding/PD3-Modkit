@@ -65,8 +65,11 @@ if defined PD3_PID (
 )
 
 echo Enter your PAYDAY 3 installation directory.
-echo Example:
-echo   C:\Program Files (x86)\Steam\steamapps\common\PAYDAY3
+echo You can also paste the Content, PAYDAY3, or Binaries\Win64 / Binaries\WinGDK folder.
+echo Examples:
+echo   Steam/Epic:  C:\Program Files (x86)\Steam\steamapps\common\PAYDAY3
+echo   Xbox/MS:     D:\Games\Payday 3
+echo   Xbox/MS bin: D:\Games\Payday 3\Content\PAYDAY3\Binaries\WinGDK
 echo.
 
 set "GAME_PATH="
@@ -94,22 +97,28 @@ if not exist "!GAME_PATH!\" (
 
 set "GAME_EXE="
 
+rem Prefer the launcher at an install root, then check all supported PC layouts.
 if exist "!GAME_PATH!\PAYDAY3.exe" (
     set "GAME_EXE=!GAME_PATH!\PAYDAY3.exe"
 )
 
-if not defined GAME_EXE if exist "!GAME_PATH!\PAYDAY3\Binaries\Win64\PAYDAY3Client-Win64-Shipping.exe" (
-    set "GAME_EXE=!GAME_PATH!\PAYDAY3\Binaries\Win64\PAYDAY3Client-Win64-Shipping.exe"
-)
-
-if not defined GAME_EXE if exist "!GAME_PATH!\PAYDAY3\Binaries\Win64\PAYDAY3-Win64-Shipping.exe" (
-    set "GAME_EXE=!GAME_PATH!\PAYDAY3\Binaries\Win64\PAYDAY3-Win64-Shipping.exe"
+rem Accept an install root, Xbox Content folder, PAYDAY3 folder, or binaries folder.
+for %%D in ("." "PAYDAY3\Binaries\Win64" "PAYDAY3\Binaries\WinGDK" "Content\PAYDAY3\Binaries\Win64" "Content\PAYDAY3\Binaries\WinGDK" "Binaries\Win64" "Binaries\WinGDK") do (
+    for %%E in (PAYDAY3Client-Win64-Shipping.exe PAYDAY3-Win64-Shipping.exe PAYDAY3Client-WinGDK-Shipping.exe PAYDAY3-WinGDK-Shipping.exe) do (
+        if not defined GAME_EXE if exist "!GAME_PATH!\%%~D\%%E" (
+            set "GAME_EXE=!GAME_PATH!\%%~D\%%E"
+        )
+    )
 )
 
 if not defined GAME_EXE (
     echo.
     echo [ERROR] Could not find a PAYDAY 3 executable under:
     echo         "!GAME_PATH!"
+    echo.
+    echo [INFO] Steam/Epic expects a Win64 executable.
+    echo [INFO] Xbox/Microsoft Store expects a WinGDK executable.
+    echo [INFO] You can also start the game in its store app, then run this script again.
     echo.
     pause
     exit /b 1
@@ -175,7 +184,7 @@ echo.
 echo [INFO] Dumping reflection data...
 echo.
 
-"%DUMPER%" --pid !PD3_PID! --engine-version 5.5 --case-preserving --all -vv PD3.jmap
+"%DUMPER%" --pid !PD3_PID! --engine-version 5.5 --case-preserving --all --infer-bitmasks --infer-exec-pins -vv PD3.jmap
 set "DUMPER_EXIT=!ERRORLEVEL!"
 
 if defined PD3_SUSPENDED (
@@ -235,12 +244,24 @@ exit /b 0
 :FindPD3Process
 set "PD3_PID="
 
+rem Steam/Epic process names.
 for /f "tokens=2 delims=," %%P in ('tasklist /FI "IMAGENAME eq PAYDAY3-Win64-Shipping.exe" /FO CSV /NH 2^>nul') do (
     set "PD3_PID=%%~P"
     goto ValidatePD3Pid
 )
 
 for /f "tokens=2 delims=," %%P in ('tasklist /FI "IMAGENAME eq PAYDAY3Client-Win64-Shipping.exe" /FO CSV /NH 2^>nul') do (
+    set "PD3_PID=%%~P"
+    goto ValidatePD3Pid
+)
+
+rem Xbox app / Microsoft Store (GDK) process names.
+for /f "tokens=2 delims=," %%P in ('tasklist /FI "IMAGENAME eq PAYDAY3Client-WinGDK-Shipping.exe" /FO CSV /NH 2^>nul') do (
+    set "PD3_PID=%%~P"
+    goto ValidatePD3Pid
+)
+
+for /f "tokens=2 delims=," %%P in ('tasklist /FI "IMAGENAME eq PAYDAY3-WinGDK-Shipping.exe" /FO CSV /NH 2^>nul') do (
     set "PD3_PID=%%~P"
     goto ValidatePD3Pid
 )
