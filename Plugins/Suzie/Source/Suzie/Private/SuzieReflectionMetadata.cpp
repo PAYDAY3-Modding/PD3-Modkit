@@ -80,6 +80,27 @@ namespace SuzieReflectionMetadata
         return Result;
     }
 
+    static void ApplyField(UField* Field, const TSharedPtr<FJsonObject>& Definition,
+        const TSharedPtr<FJsonObject>& Overrides, const TCHAR* Section)
+    {
+        const auto Set = [Field](const TCHAR* Key, const TCHAR* Value) { Field->SetMetaData(Key, Value); };
+        ApplyMap(ObjectField(ObjectField(Overrides, Section), Field->GetPathName()), Set);
+        ApplyMap(ObjectField(Definition, TEXT("metadata")), Set);
+        ApplyMap(ObjectField(ObjectField(ObjectField(Overrides, TEXT("$project_overrides")), Section), Field->GetPathName()), Set);
+    }
+
+    void ApplyClass(UClass* Class, const TSharedPtr<FJsonObject>& Definition,
+        const TSharedPtr<FJsonObject>& Overrides)
+    {
+        ApplyField(Class, Definition, Overrides, TEXT("classes"));
+    }
+
+    void ApplyFunction(UFunction* Function, const TSharedPtr<FJsonObject>& Definition,
+        const TSharedPtr<FJsonObject>& Overrides)
+    {
+        ApplyField(Function, Definition, Overrides, TEXT("functions"));
+    }
+
     void ApplyProperty(FProperty* Property, const TSharedPtr<FJsonObject>& Definition,
         const TSharedPtr<FJsonObject>& Overrides)
     {

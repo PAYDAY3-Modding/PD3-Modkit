@@ -3348,11 +3348,9 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     }
 
     // Mark all dynamic classes as blueprintable and blueprint types, otherwise we will not be able to use them.
-    // ShowWorldContextPin recreates UCLASS(meta=(ShowWorldContextPin)) behaviour that
-    // was previously supplied by generated headers rather than the runtime jmap.
     NewClass->SetMetaData(FBlueprintMetadata::MD_AllowableBlueprintVariableType, TEXT("true"));
     NewClass->SetMetaData(FBlueprintMetadata::MD_IsBlueprintBase, TEXT("true"));
-    NewClass->SetMetaData(FBlueprintMetadata::MD_ShowWorldContextPin, TEXT("true"));
+    SuzieReflectionMetadata::ApplyClass(NewClass, ClassDefinition, Context.MetadataOverrides);
 
     if (NewClass->IsChildOf<UActorComponent>())
     {
@@ -3968,11 +3966,6 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
         if (Property->IsA<FObjectProperty>() && (Property->GetFName() == TEXT("WorldContext") || Property->GetFName() == TEXT("WorldContextObject")))
         {
             NewFunction->SetMetaData(FBlueprintMetadata::MD_WorldContext, *Property->GetName());
-
-            // jmap does not carry UHT metadata. Keep these functions callable from
-            // generated UObject/subsystem Blueprint parents; ShowWorldContextPin on
-            // the class makes the otherwise-hidden context pin explicit.
-            NewFunction->SetMetaData(FBlueprintMetadata::MD_CallableWithoutWorldContext, TEXT("true"));
         }
         // Latent Info struct parameter properties should always be tagged as LatentInfo and indicate async BP functions
         if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property); StructProperty && StructProperty->Struct == FLatentActionInfo::StaticStruct())
@@ -3981,6 +3974,12 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
             NewFunction->SetMetaData(FBlueprintMetadata::MD_Latent, TEXT("true"));
         }
     }
+
+    // Captured metadata (including nonstandard WorldContext parameter names,
+    // HidePin, DefaultToSelf and CallableWithoutWorldContext) overrides the legacy
+    // parameter-name fallbacks above. Never declare every context-dependent
+    // function safe to call without a world merely to make it appear in a menu.
+    SuzieReflectionMetadata::ApplyFunction(NewFunction, FunctionDefinition, Context.MetadataOverrides);
 
     // Class-owned functions are discovered when their UClass is registered.
     // Package-owned functions (typically delegate signatures) have no class parent,
@@ -5569,6 +5568,16 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
 
     // Recursively deserialize property values for the default object and its subobjects (and their nested subobjects)
     DeserializeObjectAndSubobjectPropertyValuesRecursive(Context, ClassDefaultObject, ClassDefaultObjectDefinition);
+
+    // Match BlueprintEditorUtils' GetWorld check using the fully initialized CDO.
+    // Actors, level scripts, components and other world-aware native bases can
+    // supply self automatically. Only classes without that support need the
+    // explicit-pin fallback. Preserve source/inherited ShowWorldContextPin.
+    if (ClassDefaultObject && !ClassDefaultObject->ImplementsGetWorld()
+        && !Class->HasMetaDataHierarchical(FBlueprintMetadata::MD_ShowWorldContextPin))
+    {
+        Class->SetMetaData(FBlueprintMetadata::MD_ShowWorldContextPin, TEXT("true"));
+    }
 
     if (Class->GetPathName() == TEXT("/Script/Starbreeze.SBZInteractableDoor"))
     {
