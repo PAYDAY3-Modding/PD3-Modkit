@@ -2,6 +2,7 @@
 	"BuildId": "45308880-7303-496f-bd95-71e30dbcb4df",
 	"Modules": 
 	{
-		"CrimeFactory": "UnrealEditor-CrimeFactory.dll"
+		"CrimeFactory": "UnrealEditor-CrimeFactory.dll",
+		"CrimeFactoryEditorVisualizers": "UnrealEditor-CrimeFactoryEditorVisualizers.dll"
 	}
 }
