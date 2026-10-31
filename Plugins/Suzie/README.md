@@ -11,6 +11,16 @@ Suzie works in conjunction with [jmap_dumper](https://github.com/trumank/jmap), 
 3. Suzie reads this file and generates all necessary classes at editor startup and during cooking
 4. All native game classes become available in the Blueprint editor
 
+Function metadata in the Jmap is applied automatically to every reconstructed
+function, including `ExpandEnumAsExecs`. No per-function configuration is needed.
+The bundled dumper's `--infer-exec-pins` option reconstructs missing expansion
+metadata for enum outputs named `Exec`, `ExecResult`, or `OutputExec` on impure
+Blueprint-callable functions. `GenerateJmap.bat` enables this automatically.
+Inferred entries carry `JmapInferredExpandEnumAsExecs`; captured metadata always
+wins. Suzie reads the resulting function metadata without function-specific rules.
+Other enum parameters retain data pins because their intended editor presentation
+cannot be recovered reliably from reflection alone.
+
 ## Supported Engine Versions
 
 Suzie has been tested on Unreal Engine 5.3 through 5.6. Other versions may require minor tweaks (please submit a PR with fixes or create an issue showing errors).
