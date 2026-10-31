@@ -38,6 +38,7 @@ public class CrimeFactory : ModuleRules
 			"UATHelper",
 			"DesktopPlatform",
 			"AssetRegistry",
+            "CollectionManager",
 			"AssetTools",
 			"EditorScriptingUtilities",
 			"ApplicationCore",

@@ -16,6 +16,9 @@
 #include "Async/Async.h"
 #include "IUATHelperModule.h"
 #include "Engine/PrimaryAssetLabel.h"
+#include "CollectionManagerModule.h"
+#include "ICollectionManager.h"
+#include "PD3PrimaryAssetLabelValidation.h"
 #include "EditorAssetLibrary.h"
 #include "Editor.h"
 #include "Subsystems/EditorAssetSubsystem.h"
@@ -897,6 +900,99 @@ namespace
 		);
 	}
 
+    struct FCrimeFactoryPALReferences
+    {
+        TArray<FSoftObjectPath> Assets;
+        TArray<FSoftObjectPath> Blueprints;
+        TArray<FSoftObjectPath> Directory;
+        TArray<FString> Errors;
+        TArray<FString> Warnings;
+    };
+
+    // Resolve sources at use time. Never materialize collection members in the PAL.
+    FCrimeFactoryPALReferences ResolvePALReferences(const UPrimaryAssetLabel& Label)
+    {
+        FCrimeFactoryPALReferences Result;
+        for (const auto& Asset : Label.ExplicitAssets)
+            if (!Asset.IsNull()) Result.Assets.AddUnique(Asset.ToSoftObjectPath());
+        for (const auto& Blueprint : Label.ExplicitBlueprints)
+        {
+            const FSoftObjectPath ClassPath = Blueprint.ToSoftObjectPath();
+            if (ClassPath.IsNull()) continue;
+            // _C is an object suffix, never part of the owning Blueprint package.
+            if (ClassPath.GetLongPackageName().StartsWith(TEXT("/Script/")))
+            {
+                Result.Warnings.Add(TEXT("PAL native class is not a cookable Blueprint package: ") + ClassPath.ToString());
+                continue;
+            }
+            Result.Blueprints.AddUnique(ClassPath);
+        }
+        IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+        if (Label.bLabelAssetsInMyDirectory)
+        {
+            TArray<FAssetData> DirectoryAssets;
+            Registry.GetAssetsByPath(FName(*FPackageName::GetLongPackagePath(Label.GetOutermost()->GetName())), DirectoryAssets, true);
+            for (const FAssetData& Asset : DirectoryAssets)
+                if (Label.bIncludeRedirectors || !Asset.IsRedirector()) Result.Directory.AddUnique(Asset.GetSoftObjectPath());
+        }
+        const FName CollectionName = Label.AssetCollection.CollectionName;
+        if (CollectionName.IsNone()) return Result;
+        ICollectionManager& Collections = FCollectionManagerModule::GetModule().Get();
+        TArray<FCollectionNameType> Matches;
+        // UE5.5 FCollectionReference stores only the name. Match native PAL's CST_All semantics.
+        Collections.GetCollections(CollectionName, Matches);
+        if (Matches.IsEmpty())
+        {
+            Result.Errors.Add(FString::Printf(TEXT("PAL %s references missing collection '%s'."), *Label.GetPathName(), *CollectionName.ToString()));
+            return Result;
+        }
+        for (const FCollectionNameType& Match : Matches)
+        {
+            ECollectionStorageMode::Type StorageMode;
+            if (!Collections.GetCollectionStorageMode(Match.Name, Match.Type, StorageMode))
+            {
+                Result.Errors.Add(TEXT("Cannot resolve collection storage mode: ") + Match.Name.ToString());
+                continue;
+            }
+            if (StorageMode == ECollectionStorageMode::Dynamic)
+            {
+                // Native PAL GetAssetsInCollection cannot evaluate Content Browser search queries.
+                // Fail explicitly rather than accepting an apparently empty, incomplete mod.
+                Result.Errors.Add(FString::Printf(TEXT("Collection '%s' (%s) is dynamic. UE5.5 PALs require a static collection; dynamic search results cannot be used as a deterministic native PAL source."), *Match.Name.ToString(), ECollectionShareType::ToString(Match.Type)));
+                continue;
+            }
+            TArray<FSoftObjectPath> Members;
+            Collections.GetAssetsInCollection(Match.Name, Match.Type, Members, ECollectionRecursionFlags::Self);
+            for (const FSoftObjectPath& Member : Members)
+            {
+                if (UE::PD3CookedEditor::PrimaryAssetLabels::IsCookedReference(Member))
+                {
+                    const FString Warning = FString::Printf(TEXT("Collection '%s': cooked asset excluded from forging: %s"), *Match.Name.ToString(), *Member.ToString());
+                    Result.Warnings.Add(Warning);
+                    UE_LOG(LogCrimeFactory, Warning, TEXT("%s"), *Warning);
+                    continue;
+                }
+                const FString PackageName = Member.GetLongPackageName();
+                if (!FPackageName::IsValidLongPackageName(PackageName) || PackageName.StartsWith(TEXT("/Script/"))
+                    || !DoesSoftReferencePackageExist(Member))
+                {
+                    Result.Errors.Add(FString::Printf(TEXT("Collection '%s' member cannot resolve to a cookable package: %s"), *Match.Name.ToString(), *Member.ToString()));
+                    continue;
+                }
+                const FAssetData Asset = Registry.GetAssetByObjectPath(Member);
+                if (Asset.IsRedirector() && !Label.bIncludeRedirectors) continue;
+                // Package existence alone is not proof that a referenced object is valid.
+                if (!Asset.IsValid())
+                {
+                    Result.Errors.Add(FString::Printf(TEXT("Collection '%s' has an invalid asset reference: %s"), *Match.Name.ToString(), *Member.ToString()));
+                    continue;
+                }
+                Result.Assets.AddUnique(Member);
+            }
+        }
+        return Result;
+    }
+
 	struct FCrimeFactoryPALInspectionData
 	{
 		FString PluginName;
@@ -924,6 +1020,8 @@ namespace
 		TArray<FString> ExternalGameAssets;
 		TArray<FString> ManagedChunkCandidates;
 		TArray<FString> MissingExplicitReferences;
+        TArray<FString> ResolutionErrors;
+        TArray<FString> ResolutionWarnings;
 	};
 
 	void AddUniqueInspectionPath(
@@ -1011,6 +1109,9 @@ namespace
 		if (Label)
 		{
 			Data.bPALFound = true;
+            const auto Resolved = ResolvePALReferences(*Label);
+            Data.ResolutionErrors = Resolved.Errors;
+            Data.ResolutionWarnings = Resolved.Warnings;
 			Data.bRuntimeLabel =
 				Label->bIsRuntimeLabel;
 			Data.bLabelAssetsInMyDirectory =
@@ -1027,20 +1128,18 @@ namespace
 
 			if (Data.bLabelAssetsInMyDirectory)
 			{
-				for (const FString& PluginAsset :
-					Data.PluginAssets)
+				for (const FSoftObjectPath& PluginAsset : Resolved.Directory)
 				{
 					AddUniqueInspectionPath(
 						Data.ManagedChunkCandidates,
-						PluginAsset);
+						PluginAsset.ToString());
 				}
 			}
 
-			for (const TSoftObjectPtr<UObject>& ExplicitAsset :
-				Label->ExplicitAssets)
+			for (const FSoftObjectPath& ExplicitAsset : Resolved.Assets)
 			{
 				const FSoftObjectPath AssetPath =
-					ExplicitAsset.ToSoftObjectPath();
+					ExplicitAsset;
 
 				if (AssetPath.IsNull())
 				{
@@ -1086,11 +1185,10 @@ namespace
 				}
 			}
 
-			for (const TSoftClassPtr<UObject>& ExplicitBlueprint :
-				Label->ExplicitBlueprints)
+			for (const FSoftObjectPath& ExplicitBlueprint : Resolved.Blueprints)
 			{
 				const FSoftObjectPath AssetPath =
-					ExplicitBlueprint.ToSoftObjectPath();
+					ExplicitBlueprint;
 
 				if (AssetPath.IsNull())
 				{
@@ -1559,6 +1657,8 @@ namespace
         View->ExternalAssetCount = Data.ExternalAssets.Num() + Data.ExternalBlueprints.Num();
         View->bCanFix = HasAutoFixablePALInspectionWarnings(Data);
         View->Issues = GetPALInspectionIssues(Data);
+        for (const FString& Error : Data.ResolutionErrors) View->Issues.Add(Error);
+        for (const FString& Warning : Data.ResolutionWarnings) View->Issues.Add(Warning);
         for (const FString& Path : Data.MissingExplicitReferences) View->MissingPaths.Add(Path);
         View->InformationReport = Summary;
         View->AssetsReport = BuildPALAssetReport(Data);
@@ -1618,7 +1718,8 @@ namespace
 
 		if (!PackageName.IsEmpty())
 		{
-			PackageNames.AddUnique(PackageName);
+			if (!PackageNames.ContainsByPredicate([&PackageName](const FString& Existing) { return Existing.Equals(PackageName, ESearchCase::IgnoreCase); }))
+                PackageNames.Add(PackageName);
 		}
 	}
 
@@ -2107,6 +2208,12 @@ namespace
 		const FCrimeFactoryPALInspectionData Data =
 			BuildPALInspectionData(Plugin);
 
+        if (!Data.ResolutionErrors.IsEmpty())
+        {
+            for (const FString& Error : Data.ResolutionErrors) UE_LOG(LogCrimeFactory, Error, TEXT("%s"), *Error);
+            return false;
+        }
+
 		if (!Data.bPALFound)
 		{
 			UE_LOG(
@@ -2331,63 +2438,8 @@ namespace
 			return INDEX_NONE;
 		}
 
-		bool bHasExternalContent = false;
-
-		// Explicit Assets can point outside /<PluginName>/ and are the main
-		// mechanism used for /Game replacement assets.
-		for (const TSoftObjectPtr<UObject>& ExplicitAsset : Label->ExplicitAssets)
-		{
-			const FSoftObjectPath AssetPath =
-				ExplicitAsset.ToSoftObjectPath();
-
-			if (IsOutsidePluginMount(AssetPath, PluginMountPath))
-			{
-				UE_LOG(
-					LogCrimeFactory,
-					Display,
-					TEXT(
-						"PAL %s manages external asset %s. "
-						"Two-stage cook is required."
-					),
-					*PALPath,
-					*AssetPath.ToString()
-				);
-
-				bHasExternalContent = true;
-				break;
-			}
-		}
-
-		// Explicit Blueprints are a separate PAL list in UE5. Treat them the
-		// same way so class replacements outside the plugin also trigger pass 2.
-		if (!bHasExternalContent)
-		{
-			for (const TSoftClassPtr<UObject>& ExplicitBlueprint :
-				Label->ExplicitBlueprints)
-			{
-				const FSoftObjectPath AssetPath =
-					ExplicitBlueprint.ToSoftObjectPath();
-
-				if (IsOutsidePluginMount(
-					AssetPath,
-					PluginMountPath))
-				{
-					UE_LOG(
-						LogCrimeFactory,
-						Display,
-						TEXT(
-							"PAL %s manages external blueprint %s. "
-							"Two-stage cook is required."
-						),
-						*PALPath,
-						*AssetPath.ToString()
-					);
-
-					bHasExternalContent = true;
-					break;
-				}
-			}
-		}
+        const auto Data = BuildPALInspectionData(Plugin);
+        const bool bHasExternalContent = !Data.ExternalAssets.IsEmpty() || !Data.ExternalBlueprints.IsEmpty();
 
 		if (!bHasExternalContent)
 		{
@@ -2395,8 +2447,7 @@ namespace
 				LogCrimeFactory,
 				Display,
 				TEXT(
-					"PAL %s contains no Explicit Assets or Explicit "
-					"Blueprints outside %s. Skipping PASS 2 and using "
+					"PAL %s contains no resolved references outside %s. Skipping PASS 2 and using "
 					"the normal plugin DLC cook only."
 				),
 				*PALPath,
@@ -3867,15 +3918,17 @@ FCrimeFactoryPreflightResult SCrimeFactoryModEntry::CollectPreflightResult() con
 			Result.Warning(TEXT("PAL is not marked as a runtime label."));
 		}
 
+        const auto Resolved = ResolvePALReferences(*Label);
+        for (const FString& Error : Resolved.Errors) Result.Error(Error);
+        for (const FString& Warning : Resolved.Warnings) Result.Warning(Warning);
 		int32 ExternalAssetCount = 0;
 		int32 ExternalBlueprintCount = 0;
 		int32 MissingExplicitReferenceCount = 0;
 
-		for (const TSoftObjectPtr<UObject>& ExplicitAsset :
-			Label->ExplicitAssets)
+		for (const FSoftObjectPath& ExplicitAsset : Resolved.Assets)
 		{
 			const FSoftObjectPath AssetPath =
-				ExplicitAsset.ToSoftObjectPath();
+				ExplicitAsset;
 
 			if (AssetPath.IsNull())
 			{
@@ -3901,11 +3954,10 @@ FCrimeFactoryPreflightResult SCrimeFactoryModEntry::CollectPreflightResult() con
 			}
 		}
 
-		for (const TSoftClassPtr<UObject>& ExplicitBlueprint :
-			Label->ExplicitBlueprints)
+		for (const FSoftObjectPath& ExplicitBlueprint : Resolved.Blueprints)
 		{
 			const FSoftObjectPath AssetPath =
-				ExplicitBlueprint.ToSoftObjectPath();
+				ExplicitBlueprint;
 
 			if (AssetPath.IsNull())
 			{
@@ -4737,3 +4789,4 @@ int32 UCrimeFactoryPALCommandlet::Main(const FString& Params)
 	}
 	return WritePALPackagingManifest(*Plugin, ChunkId, Output) ? 0 : 1;
 }
+
