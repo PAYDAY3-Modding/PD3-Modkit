@@ -1,6 +1,7 @@
 #include "CrimeFactoryBillboardManager.h"
 
 #include "CrimeFactoryActorVisualisationSettings.h"
+#include "CrimeFactoryBillboardComponent.h"
 #include "Components/BillboardComponent.h"
 #include "Editor.h"
 #include "Engine/Engine.h"
@@ -305,6 +306,12 @@ void FCrimeFactoryBillboardManager::UpdateActor(AActor* Actor)
     for (UBillboardComponent* Candidate : Components)
     {
         if (!IsManaged(Candidate)) { continue; }
+        if (!Candidate->IsA<UCrimeFactoryBillboardComponent>())
+        {
+            Candidate->DetachFromComponent(FDetachmentTransformRules(EDetachmentRule::KeepRelative, false));
+            Candidate->DestroyComponent();
+            continue;
+        }
         if (!Billboard) { Billboard = Candidate; }
         else
         {
@@ -315,8 +322,8 @@ void FCrimeFactoryBillboardManager::UpdateActor(AActor* Actor)
     if (!Billboard)
     {
         FCookLoadScope EditorOnlyLoadScope(ECookLoadType::EditorOnly);
-        Billboard = NewObject<UBillboardComponent>(Actor,
-            MakeUniqueObjectName(Actor, UBillboardComponent::StaticClass(), BillboardName),
+        Billboard = NewObject<UCrimeFactoryBillboardComponent>(Actor,
+            MakeUniqueObjectName(Actor, UCrimeFactoryBillboardComponent::StaticClass(), BillboardName),
             RF_Transient | RF_DuplicateTransient | RF_TextExportTransient);
         Billboard->SetIsVisualizationComponent(true);
         // Instance provenance prevents native-component fixup from adopting this preview

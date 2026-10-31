@@ -6,6 +6,6 @@ public class CrimeFactoryEditorVisualizers : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "DeveloperSettings" });
-        PrivateDependencyModuleNames.AddRange(new[] { "UnrealEd", "Settings" });
+        PrivateDependencyModuleNames.AddRange(new[] { "UnrealEd", "Settings", "RenderCore" });
     }
 }
