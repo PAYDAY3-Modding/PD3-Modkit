@@ -15,9 +15,11 @@
  * When the user accepts an update, Unreal saves dirty packages and launches a
  * visible PowerShell/WPF helper before closing. The helper waits for the editor
  * process to exit, creates a full safety backup of the project's Content folder,
- * temporarily stashes tracked and untracked Git changes, performs a fast-forward
- * update, restores those local changes, and then reopens the same .uproject with
- * the same Unreal Editor executable. Local commits are never rewritten.
+ * snapshots tracked changes and staging under a unique recovery ref and backs up
+ * untracked/ignored data, performs a fast-forward update, restores compatible local
+ * changes, then regenerates, cleans and rebuilds the editor target before reopening.
+ * Ambiguous changes require review; checkpoints allow rebuild/recovery retries.
+ * Local commits and unrelated stashes are never rewritten.
  */
 class FPD3ModkitUpdater
 {
