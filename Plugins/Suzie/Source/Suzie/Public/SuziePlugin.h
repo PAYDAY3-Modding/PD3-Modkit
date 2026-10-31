@@ -62,7 +62,6 @@ public:
     virtual void ShutdownModule() override;
 
 private:
-    friend class FSuzieEnumMetadataTest;
     TSharedPtr<FUICommandList> PluginCommands;
     TSharedPtr<FSlateStyleSet> PluginStyle;
 

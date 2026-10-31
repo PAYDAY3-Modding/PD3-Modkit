@@ -1190,6 +1190,12 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
         {TEXT("CLASS_CollapseCategories"), CLASS_CollapseCategories},
         {TEXT("CLASS_Const"), CLASS_Const},
         {TEXT("CLASS_DefaultToInstanced"), CLASS_DefaultToInstanced},
+        // This flag gates instancing of templates during UObject construction.
+        // StaticLink does not reconstruct the UHT class flag for native classes.
+        {TEXT("CLASS_HasInstancedReference"), CLASS_HasInstancedReference},
+        {TEXT("CLASS_Hidden"), CLASS_Hidden},
+        {TEXT("CLASS_HideDropDown"), CLASS_HideDropDown},
+        {TEXT("CLASS_Deprecated"), CLASS_Deprecated},
         {TEXT("CLASS_Interface"), CLASS_Interface},
     };
 
@@ -1229,7 +1235,7 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
 
     //Set super structure and ClassWithin (they are required prior to registering)
     ConstructedClassObject->SetSuperStruct(ParentClass);
-    ConstructedClassObject->ClassWithin = UObject::StaticClass();
+    ConstructedClassObject->ClassWithin = ParentClass->ClassWithin;
     // UE 5.5+ generates TotalFieldCount during UStruct::Link/StaticLink.
     // Do not write the internal TotalFieldCount field directly; newer engine
     // versions deprecate that API and StaticLink() below is the authoritative
@@ -3481,6 +3487,7 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     static const TArray<TPair<FString, EStructFlags>> StructFlagNameLookup = {
         {TEXT("STRUCT_Atomic"), STRUCT_Atomic},
         {TEXT("STRUCT_Immutable"), STRUCT_Immutable},
+        {TEXT("STRUCT_HasInstancedReference"), STRUCT_HasInstancedReference},
     };
 
     // Convert struct flag names to the struct flags bitmask.
@@ -4836,6 +4843,36 @@ namespace
             // A suppressed/replaced subobject must not leave a CDO reference.
             SubobjectMap.Add(Template, Instance && Instance->IsA(Template->GetClass()) ? Instance : nullptr);
         }, true);
+
+        // Missing game-native constructors also assign owner properties to their
+        // default subobjects (for example SplineComponent = RootComponent). Creating
+        // the subobject alone does not perform that assignment. The general defaults
+        // copy deliberately skips instanced/exported properties, and UE's native fast
+        // path assumes the C++ constructor already initialized these references.
+        // Reconnect only explicit native-template references to existing local DSOs.
+        // Never copy a CDO pointer or duplicate an unrelated instanced object graph.
+        // Archetype/serialized Blueprint overrides are applied after construction.
+        for (TFieldIterator<FObjectProperty> It(NativeClass); It; ++It)
+        {
+            FObjectProperty* Property = *It;
+            for (int32 Index = 0; Index < Property->ArrayDim; ++Index)
+            {
+                UObject* Template = Property->GetObjectPropertyValue(
+                    Property->ContainerPtrToValuePtr<void>(NativeCDO, Index));
+                UObject* const* Local = SubobjectMap.Find(Template);
+                if (!Template || Template == NativeCDO || !Local || !*Local
+                    || !(*Local)->IsA(Property->PropertyClass))
+                {
+                    continue;
+                }
+                void* Value = Property->ContainerPtrToValuePtr<void>(Object, Index);
+                UObject* Current = Property->GetObjectPropertyValue(Value);
+                if (Current == nullptr || Current == Template)
+                {
+                    Property->SetObjectPropertyValue(Value, *Local);
+                }
+            }
+        }
 
         for (const TPair<UObject*, UObject*>& Pair : SubobjectMap)
         {

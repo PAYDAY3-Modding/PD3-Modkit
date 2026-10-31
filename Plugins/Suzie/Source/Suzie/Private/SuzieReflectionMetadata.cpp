@@ -52,6 +52,18 @@ namespace SuzieReflectionMetadata
         const auto Set = [Property](const TCHAR* Key, const TCHAR* Value) { Property->SetMetaData(Key, Value); };
         ApplyMap(ObjectField(Definition, TEXT("metadata")), Set);
         ApplyMap(ObjectField(ObjectField(Overrides, TEXT("properties")), Property->GetPathName()), Set);
+        // UHT emits EditInline metadata for Instanced strong UObject references.
+        // Shipping reflection retains the storage/ownership flags but strips this
+        // metadata. PropertyNode uses it to select the stock inline class picker.
+        // BuildProperty visits container elements and struct members too. Do not
+        // turn weak/soft/class references or ordinary object references into owners.
+        if (Property->IsA<FObjectProperty>() && !Property->IsA<FClassProperty>()
+            && Property->HasAnyPropertyFlags(CPF_InstancedReference)
+            && !Property->HasMetaData(TEXT("NoEditInline"))
+            && !Property->HasMetaData(TEXT("EditInline")))
+        {
+            Property->SetMetaData(TEXT("EditInline"), TEXT("true"));
+        }
     }
 
     void ApplyEnum(UEnum* Enum, const TSharedPtr<FJsonObject>& Definition,
