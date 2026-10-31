@@ -1,5 +1,6 @@
 #include "SuzieReflectionMetadata.h"
 #include "SuziePlugin.h"
+#include "Interfaces/IPluginManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
@@ -31,9 +32,8 @@ namespace SuzieReflectionMetadata
         }
     }
 
-    TSharedPtr<FJsonObject> LoadOverrides()
+    static TSharedPtr<FJsonObject> LoadMetadataFile(const FString& Path)
     {
-        const FString Path = FPaths::ProjectConfigDir() / TEXT("SuzieMetadata.json");
         if (!FPaths::FileExists(Path)) return nullptr;
         FString Json;
         TSharedPtr<FJsonObject> Result;
@@ -43,6 +43,40 @@ namespace SuzieReflectionMetadata
             UE_LOG(LogSuzie, Error, TEXT("Cannot read metadata overrides: %s"), *Path);
             return nullptr;
         }
+        UE_LOG(LogSuzie, Display, TEXT("Loaded reflection metadata: %s"), *Path);
+        return Result;
+    }
+
+    static void MergeMetadata(const TSharedPtr<FJsonObject>& Destination, const TSharedPtr<FJsonObject>& Source)
+    {
+        if (!Source.IsValid()) return;
+        for (const auto& Pair : Source->Values)
+        {
+            const TSharedPtr<FJsonObject> Existing = ObjectField(Destination, Pair.Key);
+            if (Existing.IsValid() && Pair.Value->Type == EJson::Object)
+            {
+                MergeMetadata(Existing, Pair.Value->AsObject());
+            }
+            else
+            {
+                Destination->SetField(Pair.Key, Pair.Value);
+            }
+        }
+    }
+
+    TSharedPtr<FJsonObject> LoadOverrides()
+    {
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        // Keep verified mappings with the plugin so a source ZIP or BuildPlugin
+        // package is sufficient. Project overrides are optional and take precedence
+        // per metadata key, rather than discarding the rest of a bundled mapping.
+        if (const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Suzie")))
+        {
+            MergeMetadata(Result, LoadMetadataFile(Plugin->GetBaseDir() / TEXT("Config/SuzieMetadata.json")));
+        }
+        const TSharedPtr<FJsonObject> Project = LoadMetadataFile(FPaths::ProjectConfigDir() / TEXT("SuzieMetadata.json"));
+        MergeMetadata(Result, Project);
+        if (Project.IsValid()) Result->SetObjectField(TEXT("$project_overrides"), Project);
         return Result;
     }
 
@@ -50,8 +84,9 @@ namespace SuzieReflectionMetadata
         const TSharedPtr<FJsonObject>& Overrides)
     {
         const auto Set = [Property](const TCHAR* Key, const TCHAR* Value) { Property->SetMetaData(Key, Value); };
-        ApplyMap(ObjectField(Definition, TEXT("metadata")), Set);
         ApplyMap(ObjectField(ObjectField(Overrides, TEXT("properties")), Property->GetPathName()), Set);
+        ApplyMap(ObjectField(Definition, TEXT("metadata")), Set);
+        ApplyMap(ObjectField(ObjectField(ObjectField(Overrides, TEXT("$project_overrides")), TEXT("properties")), Property->GetPathName()), Set);
         // UHT emits EditInline metadata for Instanced strong UObject references.
         // Shipping reflection retains the storage/ownership flags but strips this
         // metadata. PropertyNode uses it to select the stock inline class picker.
@@ -69,10 +104,25 @@ namespace SuzieReflectionMetadata
     void ApplyEnum(UEnum* Enum, const TSharedPtr<FJsonObject>& Definition,
         const TSharedPtr<FJsonObject>& Overrides)
     {
-        const auto Apply = [Enum](const TSharedPtr<FJsonObject>& Source)
+        const auto Apply = [Enum](const TSharedPtr<FJsonObject>& Source, bool bFromDump = false)
         {
-            ApplyMap(ObjectField(Source, TEXT("metadata")),
-                [Enum](const TCHAR* Key, const TCHAR* Value) { Enum->SetMetaData(Key, Value); });
+            const TSharedPtr<FJsonObject> Metadata = ObjectField(Source, TEXT("metadata"));
+            // Real native editor metadata outranks heuristically inferred settings.
+            const bool bKeepMode = bFromDump && Metadata.IsValid()
+                && Metadata->HasField(TEXT("JmapInferredMaskMode"))
+                && Enum->HasMetaData(TEXT("UseEnumValuesAsMaskValuesInEditor"))
+                && !Enum->HasMetaData(TEXT("JmapInferredMaskMode"));
+            const bool bKeepFlags = bFromDump && Metadata.IsValid()
+                && Metadata->HasField(TEXT("JmapInferredBitflags"))
+                && Enum->HasMetaData(TEXT("Bitflags")) && !Enum->HasMetaData(TEXT("JmapInferredBitflags"));
+            ApplyMap(Metadata, [Enum, bKeepMode, bKeepFlags](const TCHAR* Key, const TCHAR* Value)
+            {
+                if (bKeepMode && (FCString::Stricmp(Key, TEXT("UseEnumValuesAsMaskValuesInEditor")) == 0
+                    || FCString::Stricmp(Key, TEXT("JmapInferredMaskMode")) == 0)) return;
+                if (bKeepFlags && (FCString::Stricmp(Key, TEXT("Bitflags")) == 0
+                    || FCString::Stricmp(Key, TEXT("JmapInferredBitflags")) == 0)) return;
+                Enum->SetMetaData(Key, Value);
+            });
             const TSharedPtr<FJsonObject> Entries = ObjectField(Source, TEXT("entry_metadata"));
             if (!Entries.IsValid()) return;
             for (const auto& Entry : Entries->Values)
@@ -88,11 +138,19 @@ namespace SuzieReflectionMetadata
                     UE_LOG(LogSuzie, Warning, TEXT("Unknown metadata enum entry %s in %s"), *Entry.Key, *Enum->GetPathName());
                     continue;
                 }
-                ApplyMap(Entry.Value->AsObject(), [Enum, Index](const TCHAR* Key, const TCHAR* Value)
-                    { Enum->SetMetaData(Key, Value, Index); });
+                const TSharedPtr<FJsonObject> Values = Entry.Value->AsObject();
+                const bool bKeepHidden = bFromDump && Values.IsValid() && Values->HasField(TEXT("JmapInferredHidden"))
+                    && Enum->HasMetaData(TEXT("Hidden"), Index) && !Enum->HasMetaData(TEXT("JmapInferredHidden"), Index);
+                ApplyMap(Values, [Enum, Index, bKeepHidden](const TCHAR* Key, const TCHAR* Value)
+                {
+                    if (bKeepHidden && (FCString::Stricmp(Key, TEXT("Hidden")) == 0
+                        || FCString::Stricmp(Key, TEXT("JmapInferredHidden")) == 0)) return;
+                    Enum->SetMetaData(Key, Value, Index);
+                });
             }
         };
-        Apply(Definition);
         Apply(ObjectField(ObjectField(Overrides, TEXT("enums")), Enum->GetPathName()));
+        Apply(Definition, true);
+        Apply(ObjectField(ObjectField(ObjectField(Overrides, TEXT("$project_overrides")), TEXT("enums")), Enum->GetPathName()));
     }
 }

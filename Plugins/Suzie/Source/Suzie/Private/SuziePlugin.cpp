@@ -3643,6 +3643,11 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     // Check if we have already created this enum
     if (UEnum* ExistingEnum = FindObject<UEnum>(nullptr, *EnumPath))
     {
+        const TSharedPtr<FJsonObject>* Definition = nullptr;
+        if (Context.GlobalObjectMap->TryGetObjectField(EnumPath, Definition))
+        {
+            SuzieReflectionMetadata::ApplyEnum(ExistingEnum, *Definition, Context.MetadataOverrides);
+        }
         return ExistingEnum;
     }
     if (!IsSuzieReconstructibleScriptPath(EnumPath))
@@ -4420,11 +4425,37 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     if (NewProperty->HasMetaData(TEXT("Bitmask")))
     {
         const FNumericProperty* Numeric = CastField<FNumericProperty>(NewProperty);
-        const FString EnumPath = NewProperty->GetMetaData(TEXT("BitmaskEnum"));
+        FString EnumPath = NewProperty->GetMetaData(TEXT("BitmaskEnum"));
+        if (!EnumPath.IsEmpty() && !EnumPath.StartsWith(TEXT("/")))
+        {
+            // UHT metadata can contain a short enum name. Resolve that explicit
+            // symbol only when it is unique; never infer from the property name.
+            FString ResolvedPath;
+            for (const auto& Entry : Context.GlobalObjectMap->Values)
+            {
+                const TSharedPtr<FJsonObject> Definition = Entry.Value->AsObject();
+                if (Definition->GetStringField(TEXT("type")) == TEXT("Enum")
+                    && (Entry.Key.EndsWith(TEXT(".") + EnumPath)
+                        || Definition->GetStringField(TEXT("cpp_type")) == EnumPath))
+                {
+                    if (!ResolvedPath.IsEmpty())
+                    {
+                        ResolvedPath.Reset();
+                        break;
+                    }
+                    ResolvedPath = Entry.Key;
+                }
+            }
+            if (!ResolvedPath.IsEmpty())
+            {
+                EnumPath = ResolvedPath;
+                NewProperty->SetMetaData(TEXT("BitmaskEnum"), *EnumPath);
+            }
+        }
         // Metadata changes only the stock Property Editor control, never the FProperty
         // type, storage, flags, defaults, or enum values. Do not infer associations.
-        UEnum* MaskEnum = EnumPath.IsEmpty() ? nullptr : FindObject<UEnum>(nullptr, *EnumPath);
-        if (!MaskEnum && !EnumPath.IsEmpty() && Context.GlobalObjectMap->HasTypedField<EJson::Object>(EnumPath)
+        UEnum* MaskEnum = EnumPath.StartsWith(TEXT("/")) ? FindObject<UEnum>(nullptr, *EnumPath) : nullptr;
+        if (!EnumPath.IsEmpty() && Context.GlobalObjectMap->HasTypedField<EJson::Object>(EnumPath)
             && Context.GlobalObjectMap->GetObjectField(EnumPath)->GetStringField(TEXT("type")) == TEXT("Enum"))
         {
             MaskEnum = FindOrCreateEnum(Context, EnumPath);
