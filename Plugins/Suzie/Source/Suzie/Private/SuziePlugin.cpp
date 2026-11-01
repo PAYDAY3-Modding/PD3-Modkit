@@ -1,5 +1,7 @@
 #include "SuziePlugin.h"
 #include "SuzieReflectionMetadata.h"
+#include "SuzieNativeFunctions.h"
+#include "SuzieNativeLifecycle.h"
 #include "HeistAuthoring.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonReader.h"
@@ -858,7 +860,11 @@ void FSuziePluginModule::StartupModule()
         }
     }
 
+    RegisterGeneratedSuzieNativeFunctions();
+    SuzieNativeLifecycle::Start();
     ProcessAllJsonClassDefinitions();
+    SuzieNative::FinishBindings();
+    SuzieNativeLifecycle::FinishBindings();
 
     SuzieHeistAuthoring::RegisterEditorHooks();
 
@@ -894,6 +900,8 @@ void FSuziePluginModule::StartupModule()
 
 void FSuziePluginModule::ShutdownModule()
 {
+    SuzieNative::Reset();
+    SuzieNativeLifecycle::Reset();
     SuzieHeistAuthoring::UnregisterEditorHooks();
     if (GSuziePostEngineInitHandle.IsValid())
     {
@@ -1088,6 +1096,10 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     {
         FinalizeClass(ClassGenerationContext, ClassPendingFinalization);
     }
+
+    // A function can be encountered before its owning class's properties are constructed.
+    // Validate bodies only once every class in this JMAP has its final layout and CDO.
+    SuzieNative::BindAvailable();
 
     // Audit after every reflected type in this jmap exists. Existing native
     // engine/plugin types are never mutated here.
@@ -5100,6 +5112,12 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
     for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
     {
         ExecutePolymorphicClassConstructorFrameForDynamicClass(ObjectInitializer, DynamicClassHierarchyTree[i]);
+    }
+    // Callbacks see initialized Suzie/native-parent storage, scoped to their declaring
+    // class (not Blueprint-added fields). JMAP/archetype copies below still win.
+    for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
+    {
+        SuzieNativeLifecycle::InitializeClass(*ConstructedObject, *DynamicClassHierarchyTree[i]);
     }
 
     InitializeSuzieActorSubobjectDefaults(ConstructedObject, TopLevelDynamicClass);

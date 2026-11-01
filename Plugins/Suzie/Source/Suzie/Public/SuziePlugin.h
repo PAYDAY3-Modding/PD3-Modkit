@@ -60,6 +60,9 @@ class FSuziePluginModule : public IModuleInterface
 public:
     virtual void StartupModule() override;
     virtual void ShutdownModule() override;
+    // Dynamic classes and lifecycle callbacks retain native code pointers.
+    // Restart the editor to reload native implementations safely.
+    virtual bool SupportsDynamicReloading() override { return false; }
 
 private:
     TSharedPtr<FUICommandList> PluginCommands;
