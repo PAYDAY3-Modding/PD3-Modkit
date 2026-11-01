@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Containers/Ticker.h"
 #include "UObject/StrongObjectPtr.h"
+#include "CrimeFactoryPawnPreview.h"
 
 class AActor;
 class UBillboardComponent;
@@ -44,6 +45,7 @@ private:
     static bool IsEligible(const AActor* Actor);
 
     TMap<TWeakObjectPtr<UClass>, TStrongObjectPtr<UTexture2D>> Definitions;
+    FCrimeFactoryPawnPreview PawnPreviews;
     TArray<TStrongObjectPtr<UClass>> DefinitionClasses;
     TArray<TFunction<void()>> Unbinders;
     TMap<TWeakObjectPtr<AActor>, TWeakObjectPtr<UBillboardComponent>> Billboards;

@@ -19,7 +19,7 @@ public:
         FModuleManager::LoadModuleChecked<ISettingsModule>("Settings").RegisterSettings(
             "Project", "CrimeFactory", "ActorVisualisation",
             LOCTEXT("SettingsName", "Actor Visualisation"),
-            LOCTEXT("SettingsDescription", "Configure editor-only actor billboards. The closest configured ancestor supplies the icon. Duplicate class definitions are ignored with a warning."),
+            LOCTEXT("SettingsDescription", "Configure editor-only actor billboards and pawn spawn previews. The closest configured ancestor takes priority. Duplicate class definitions are ignored with a warning."),
             GetMutableDefault<UCrimeFactoryActorVisualisationSettings>());
         Manager = MakeUnique<FCrimeFactoryBillboardManager>();
         Manager->Initialize();

@@ -2,12 +2,16 @@
 
 #include "CrimeFactoryActorVisualisationSettings.h"
 #include "CrimeFactoryBillboardComponent.h"
+#include "CrimeFactoryVisualisationComponents.h"
 #include "Components/BillboardComponent.h"
 #include "Editor.h"
 #include "Engine/Engine.h"
 #include "Engine/Level.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "EditorReimportHandler.h"
+#include "HAL/PlatformTime.h"
+#include "UObject/PackageReload.h"
 #include "UObject/ICookInfo.h"
 #include "UObject/ObjectSaveContext.h"
 #include "UObject/UObjectGlobals.h"
@@ -21,8 +25,7 @@ namespace
 
     bool IsManaged(const UBillboardComponent* Component)
     {
-        return IsValid(Component) && Component->HasAllFlags(RF_Transient | RF_DuplicateTransient | RF_TextExportTransient)
-            && Component->IsVisualizationComponent() && Component->ComponentHasTag(ManagedTag);
+        return CrimeFactoryVisualisation::IsManaged(Component, ManagedTag);
     }
 }
 
@@ -64,6 +67,7 @@ void FCrimeFactoryBillboardManager::Initialize()
     {
         TArray<TWeakObjectPtr<AActor>> Actors;
         Billboards.GetKeys(Actors);
+        PawnPreviews.GetActors(Actors);
         for (const auto& WeakActor : Actors)
         {
             AActor* Actor = WeakActor.Get();
@@ -96,6 +100,7 @@ void FCrimeFactoryBillboardManager::Initialize()
     Bind(FCoreUObjectDelegates::OnObjectPropertyChanged, [this](UObject* Object, FPropertyChangedEvent&)
     {
         if (bUpdating) { return; }
+        if (PawnPreviews.InvalidateForObject(Object)) { RequestRefresh(); }
         if (Object == GetDefault<UCrimeFactoryActorVisualisationSettings>()) { RequestRefresh(true); }
         else if (AActor* Actor = Cast<AActor>(Object)) { QueueActor(Actor); }
         else if (USceneComponent* Component = Cast<USceneComponent>(Object))
@@ -105,7 +110,16 @@ void FCrimeFactoryBillboardManager::Initialize()
     });
     Bind(FCoreUObjectDelegates::OnObjectTransacted, [this](UObject* Object, const FTransactionObjectEvent&)
     {
+        if (PawnPreviews.InvalidateForObject(Object)) { RequestRefresh(); }
         if (AActor* Actor = Cast<AActor>(Object)) { QueueActor(Actor); }
+    });
+    Bind(FReimportManager::Instance()->OnPostReimport(), [this](UObject* Object, bool bSucceeded)
+    {
+        if (bSucceeded && PawnPreviews.InvalidateForObject(Object)) { RequestRefresh(); }
+    });
+    Bind(FCoreUObjectDelegates::OnPackageReloaded, [this](EPackageReloadPhase Phase, FPackageReloadedEvent*)
+    {
+        if (Phase == EPackageReloadPhase::PostBatchPostGC) { RequestRefresh(true); }
     });
 
     // Remove previews before save/reference gathering, and recreate only after saving has finished.
@@ -222,8 +236,7 @@ void FCrimeFactoryBillboardManager::TrackLevel(ULevel* Level)
 bool FCrimeFactoryBillboardManager::Tick(float)
 {
     if (GIsSavingPackage || IsGarbageCollecting()) { return true; }
-    TickHandle.Reset();
-    if (bSuspendedForPIE || ActorExportDepth > 0) { return false; }
+    if (bSuspendedForPIE || ActorExportDepth > 0) { TickHandle.Reset(); return false; }
     TGuardValue<bool> UpdatingGuard(bUpdating, true);
     if (bReloadDefinitions)
     {
@@ -241,9 +254,17 @@ bool FCrimeFactoryBillboardManager::Tick(float)
             for (TActorIterator<AActor> It(World); It; ++It) { PendingActors.Add(*It); }
         }
     }
-    TSet<TWeakObjectPtr<AActor>> Actors = MoveTemp(PendingActors);
-    PendingActors.Reset();
-    for (const auto& Actor : Actors) { if (Actor.IsValid()) { UpdateActor(Actor.Get()); } }
+    // Bound work across editor frames when opening a large level. Shared request appearances
+    // are resolved once; there is no actor polling after this event-driven queue is drained.
+    const double Deadline = FPlatformTime::Seconds() + 0.008;
+    while (PendingActors.Num())
+    {
+        auto It = PendingActors.CreateIterator();
+        const TWeakObjectPtr<AActor> Actor = *It;
+        It.RemoveCurrent();
+        if (Actor.IsValid()) { UpdateActor(Actor.Get()); }
+        if (FPlatformTime::Seconds() >= Deadline) { break; }
+    }
     for (auto It = Billboards.CreateIterator(); It; ++It)
     {
         if (!It.Key().IsValid() || !It.Value().IsValid()) { It.RemoveCurrent(); }
@@ -252,13 +273,17 @@ bool FCrimeFactoryBillboardManager::Tick(float)
     {
         if (!It.Key().IsValid()) { It.RemoveCurrent(); }
     }
-    return false;
+    PawnPreviews.Prune();
+    const bool bMoreWork = PendingActors.Num() || bScanWorlds || bReloadDefinitions;
+    if (!bMoreWork) { TickHandle.Reset(); }
+    return bMoreWork;
 }
 
 void FCrimeFactoryBillboardManager::ReloadDefinitions()
 {
     Definitions.Empty();
     DefinitionClasses.Empty();
+    PawnPreviews.ReloadDefinitions();
     const UCrimeFactoryActorVisualisationSettings* Settings = GetDefault<UCrimeFactoryActorVisualisationSettings>();
     Scale = FMath::IsFinite(Settings->BillboardScale) ? FMath::Max(0.01f, Settings->BillboardScale) : 1.0f;
     TSet<UClass*> SeenClasses;
@@ -294,12 +319,26 @@ void FCrimeFactoryBillboardManager::ReloadDefinitions()
 void FCrimeFactoryBillboardManager::UpdateActor(AActor* Actor)
 {
     if (!IsEligible(Actor)) { RemoveActor(Actor); return; }
+    PawnPreviews.UpdateActor(*Actor);
     UTexture2D* Texture = nullptr;
     for (UClass* Class = Actor->GetClass(); Class; Class = Class->GetSuperClass())
     {
         if (const auto* Match = Definitions.Find(Class)) { Texture = Match->Get(); break; }
     }
-    if (!Texture) { RemoveActor(Actor); return; }
+    if (!Texture)
+    {
+        Billboards.Remove(Actor);
+        TInlineComponentArray<UBillboardComponent*> Components(Actor);
+        for (UBillboardComponent* Component : Components)
+        {
+            if (IsManaged(Component))
+            {
+                Component->DetachFromComponent(FDetachmentTransformRules(EDetachmentRule::KeepRelative, false));
+                Component->DestroyComponent();
+            }
+        }
+        return;
+    }
 
     UBillboardComponent* Billboard = nullptr;
     TInlineComponentArray<UBillboardComponent*> Components(Actor);
@@ -324,21 +363,8 @@ void FCrimeFactoryBillboardManager::UpdateActor(AActor* Actor)
         FCookLoadScope EditorOnlyLoadScope(ECookLoadType::EditorOnly);
         Billboard = NewObject<UCrimeFactoryBillboardComponent>(Actor,
             MakeUniqueObjectName(Actor, UCrimeFactoryBillboardComponent::StaticClass(), BillboardName),
-            RF_Transient | RF_DuplicateTransient | RF_TextExportTransient);
-        Billboard->SetIsVisualizationComponent(true);
-        // Instance provenance prevents native-component fixup from adopting this preview
-        // as the actor root while a Blueprint construction script rebuilds its own root.
-        // Ownership alone is sufficient; do not add it to serialized InstanceComponents.
-        Billboard->CreationMethod = EComponentCreationMethod::Instance;
-        Billboard->ComponentTags.Add(ManagedTag);
-        Billboard->SetHiddenInGame(true);
-        Billboard->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        Billboard->SetGenerateOverlapEvents(false);
-        Billboard->SetCanEverAffectNavigation(false);
-        Billboard->PrimaryComponentTick.bCanEverTick = false;
-        Billboard->PrimaryComponentTick.bStartWithTickEnabled = false;
-        Billboard->AlwaysLoadOnClient = false;
-        Billboard->AlwaysLoadOnServer = false;
+            CrimeFactoryVisualisation::PreviewFlags);
+        CrimeFactoryVisualisation::Configure(*Billboard, ManagedTag);
         Billboard->bIsScreenSizeScaled = true;
         Billboard->bUseInEditorScaling = true;
         // Do not call AddInstanceComponent: that array is serialized into maps and Blueprints.
@@ -366,6 +392,7 @@ void FCrimeFactoryBillboardManager::UpdateActor(AActor* Actor)
 void FCrimeFactoryBillboardManager::RemoveActor(AActor* Actor)
 {
     if (!Actor) { return; }
+    PawnPreviews.RemoveActor(*Actor);
     Billboards.Remove(Actor);
     PendingActors.Remove(Actor);
     TInlineComponentArray<UBillboardComponent*> Components(Actor);
@@ -385,6 +412,7 @@ void FCrimeFactoryBillboardManager::RemoveAll()
     Billboards.GetKeys(Actors);
     for (const auto& Actor : Actors) { if (Actor.IsValid()) { RemoveActor(Actor.Get()); } }
     Billboards.Empty();
+    PawnPreviews.RemoveAll();
 }
 
 void FCrimeFactoryBillboardManager::BeginActorExport()
