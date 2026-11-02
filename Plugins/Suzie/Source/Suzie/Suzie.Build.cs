@@ -8,7 +8,11 @@ public class Suzie : ModuleRules
 
 		PublicIncludePaths.AddRange(new string[] {}); 
 		
-		PrivateIncludePaths.Add(System.IO.Path.Combine(PluginDirectory, "Intermediate", "NativeBodies"));
+		// UBT filters missing include directories before the prebuild generator runs.
+		// Keep this directory available even immediately after a clean build.
+		string NativeBodiesDirectory = System.IO.Path.Combine(PluginDirectory, "Intermediate", "NativeBodies");
+		System.IO.Directory.CreateDirectory(NativeBodiesDirectory);
+		PrivateIncludePaths.Add(NativeBodiesDirectory);
 		ExternalDependencies.Add(System.IO.Path.Combine(PluginDirectory, "Tools", "GenerateNativeBodies.ps1"));
 
 
