@@ -10,6 +10,7 @@
 #include "HAL/PlatformMisc.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/App.h"
+#include "Misc/Guid.h"
 #include "Misc/FileHelper.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
@@ -38,6 +39,7 @@ namespace PD3ModkitUpdater
         FString RepositoryRoot;
         FString RemoteName;
         FString BranchName;
+        bool bResumePending = false;
         FString LocalCommit;
         FString RemoteCommit;
         FString LatestCommitSubject;
@@ -285,6 +287,32 @@ namespace PD3ModkitUpdater
             return Result;
         }
 
+        // An installed update can need recovery/rebuild even with no commits behind.
+        // Keep this available offline; the helper validates the checkpoint and HEAD.
+        FString CheckpointPath;
+        if (RunGitSimple(Result.RepositoryRoot,
+                TEXT("rev-parse --path-format=absolute --git-path crimefactory-update.json"),
+                CheckpointPath, Output) && IFileManager::Get().FileExists(*CheckpointPath))
+        {
+            FString CheckpointJson;
+            TSharedPtr<FJsonObject> Checkpoint;
+            if (!FFileHelper::LoadFileToString(CheckpointJson, *CheckpointPath) ||
+                !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(CheckpointJson), Checkpoint) ||
+                !Checkpoint.IsValid())
+            {
+                Result.Error = TEXT("The updater recovery checkpoint is unreadable. Review crimefactory-update.json in the Git directory before updating.");
+                return Result;
+            }
+            FString Stage;
+            if (!Checkpoint->TryGetStringField(TEXT("Stage"), Stage) || Stage != TEXT("EditorReady"))
+            {
+                Result.bResumePending = true;
+                Result.State = EUpdateState::UpdateAvailable;
+                CollectWorkingTreeChangeInfo(Result);
+                return Result;
+            }
+        }
+
         // Fetch only updates refs. It never changes the user's working tree.
         if (!RunGitSimple(
                 Result.RepositoryRoot,
@@ -391,7 +419,8 @@ namespace PD3ModkitUpdater
             FPlatformProcess::UserSettingsDir(),
             TEXT("PAYDAY3-Modding"),
             TEXT("PD3-Modkit"),
-            TEXT("Updater"));
+            TEXT("Updater"),
+            FGuid::NewGuid().ToString(EGuidFormats::Digits));
 
         const FString UpdateDirectory = OutUpdaterDirectory;
 
@@ -510,6 +539,9 @@ namespace PD3ModkitUpdater
         Config->SetStringField(TEXT("BranchName"), Result.BranchName);
         Config->SetStringField(TEXT("LogPath"), UpdateLogPath);
         Config->SetStringField(TEXT("EditorExecutable"), EditorExecutable);
+        // Use the running engine, including registered/source-built engines;
+        // the project's EngineAssociation is not necessarily a Launcher version.
+        Config->SetStringField(TEXT("EngineDirectory"), FPaths::ConvertRelativePathToFull(FPaths::EngineDir()));
         Config->SetStringField(TEXT("ProjectFile"), ProjectFile);
         Config->SetStringField(TEXT("ReadyFile"), ReadyFilePath);
 
@@ -743,10 +775,10 @@ namespace PD3ModkitUpdater
             View.Detail = TEXT("The local and remote branches have diverged. Merge or rebase your local branch manually, then check again. CrimeFactory will not rewrite your commits.");
             break;
         case EUpdateState::UpdateAvailable:
-            View.Status = TEXT("A modkit update is available");
+            View.Status = Result.bResumePending ? TEXT("A modkit update needs recovery or rebuild") : TEXT("A modkit update is available");
             View.Severity = ECrimeFactoryPreflightSeverity::Warning;
             View.bCanUpdate = true;
-            View.Detail = TEXT("Unreal Editor will save your work and close. The standalone updater will first back up the project's Content folder, temporarily stash tracked and untracked local changes, update Git, restore your changes, and reopen the project. Local commits are never rewritten automatically.");
+            View.Detail = TEXT("Unreal Editor will save your work and close. The standalone updater will back up Content, preserve local files and staging in a recovery backup, update Git, restore compatible changes, regenerate project files, and clean and rebuild the project's C++ modules before reopening. The engine's C++ build toolchain must be installed. Local commits are never rewritten automatically. Changes that overlap upstream edits need manual review; their originals and staging remain recoverable. Pending updates resume without downloading again.");
             break;
         case EUpdateState::Error:
         default:

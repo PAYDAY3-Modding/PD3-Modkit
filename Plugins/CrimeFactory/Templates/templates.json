@@ -15,6 +15,16 @@
             "name": "Custom Heist",
             "description": "Create a mod plugin that contains the basic assets needed for a custom heist.",
             "path": "CustomHeist"
+        },
+        {
+            "name": "Jukebox Track",
+            "description": "Create a Jukebox mod custom track.",
+            "path": "JukeboxTrack",
+			"dependencies": [
+				{
+					"name": "JukeboxMod"
+				}
+			]
         }
     ]
 }

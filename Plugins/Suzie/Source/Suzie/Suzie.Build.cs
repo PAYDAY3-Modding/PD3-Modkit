@@ -8,13 +8,20 @@ public class Suzie : ModuleRules
 
 		PublicIncludePaths.AddRange(new string[] {}); 
 		
-		PrivateIncludePaths.AddRange(new string[] {});
+		// UBT filters missing include directories before the prebuild generator runs.
+		// Keep this directory available even immediately after a clean build.
+		string NativeBodiesDirectory = System.IO.Path.Combine(PluginDirectory, "Intermediate", "NativeBodies");
+		System.IO.Directory.CreateDirectory(NativeBodiesDirectory);
+		PrivateIncludePaths.Add(NativeBodiesDirectory);
+		ExternalDependencies.Add(System.IO.Path.Combine(PluginDirectory, "Tools", "GenerateNativeBodies.ps1"));
 
 
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
 				"Core",
+				"CoreUObject",
+				"Engine",
 				"GameplayTags",
 			}
 			);
@@ -22,13 +29,13 @@ public class Suzie : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"CoreUObject",
-				"Engine",
 				"Blutility",
 				"Json",
 				"UnrealEd",
 				"Projects",
 				"BlueprintGraph",
+				"UMG",
+				"SlateCore",
 				"zlib",
 			}
 			);

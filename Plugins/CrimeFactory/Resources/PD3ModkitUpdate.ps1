@@ -1,5 +1,6 @@
-param(
-    [string]$ConfigPath = ''
+﻿param(
+    [string]$ConfigPath = '',
+    [switch]$RepositoryWorker
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,14 +14,12 @@ $script:ActiveStdOutTask = $null
 $script:ActiveStdErrTask = $null
 $script:UpdateCompleted = $false
 $script:PullSucceeded = $false
-$script:StashCreated = $false
-$script:StashName = 'stash@{0}'
-$script:RestoreReason = ''
 $script:ReopenAt = $null
 $script:BackupRoot = ''
 $script:BackupContentPath = ''
 $script:BackupCreated = $false
 $script:ReadySignaled = $false
+$script:RebuildPending = $false
 
 $bootstrapLogPath = Join-Path $PSScriptRoot 'PD3ModkitUpdate.bootstrap.log'
 
@@ -48,6 +47,7 @@ $LogPath = ''
 $EditorExecutable = ''
 $ProjectFile = ''
 $ReadyFile = ''
+$EngineDirectory = ''
 
 try {
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -68,6 +68,11 @@ try {
     $EditorExecutable = [string]$config.EditorExecutable
     $ProjectFile = [string]$config.ProjectFile
     $ReadyFile = [string]$config.ReadyFile
+    $EngineDirectory = [string]$config.EngineDirectory
+    # Compatibility with launch configurations written by older plugin binaries.
+    if ([string]::IsNullOrWhiteSpace($EngineDirectory)) {
+        $EngineDirectory = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $EditorExecutable) '..\..'))
+    }
 
     Write-BootstrapLog 'Updater config loaded successfully.'
 }
@@ -99,8 +104,7 @@ try {
         New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     }
 
-    New-Item -ItemType File -Path $LogPath -Force | Out-Null
-    Clear-Content -Path $LogPath
+    if (-not (Test-Path -LiteralPath $LogPath)) { New-Item -ItemType File -Path $LogPath | Out-Null }
 
     if ($EditorPid -le 0) {
         throw 'EditorPid was not supplied or was invalid.'
@@ -159,18 +163,6 @@ catch {
     exit 9
 }
 
-try {
-    Add-Type -AssemblyName PresentationFramework
-    Add-Type -AssemblyName PresentationCore
-    Add-Type -AssemblyName WindowsBase
-}
-catch {
-    $fatalMessage = "FATAL: Could not load WPF assemblies: $($_.Exception.Message)"
-    Write-BootstrapLog $fatalMessage
-    Write-UpdateLog $fatalMessage
-    exit 10
-}
-
 function Quote-NativeArgument {
     param([string]$Value)
 
@@ -219,6 +211,11 @@ function Start-ManagedProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = Split-Path -Parent $ProjectFile
+    # Environment expansion in cmd avoids interpolating project paths into shell
+    # syntax. These values remain quoted and are not recursively expanded.
+    $startInfo.EnvironmentVariables['PD3_BUILD_BATCH'] = Join-Path $EngineDirectory 'Build\BatchFiles\Build.bat'
+    $startInfo.EnvironmentVariables['PD3_BUILD_PROJECT'] = $ProjectFile
 
     $script:ActiveProcess = New-Object System.Diagnostics.Process
     $script:ActiveProcess.StartInfo = $startInfo
@@ -238,6 +235,7 @@ function Complete-ActiveProcess {
     $exitCode = $script:ActiveProcess.ExitCode
 
     Write-ProcessOutputToLog -StdOut $stdOut -StdErr $stdErr
+    Write-UpdateLog "Process exited with code $exitCode."
 
     $result = [PSCustomObject]@{
         ExitCode = $exitCode
@@ -245,10 +243,283 @@ function Complete-ActiveProcess {
         StdErr = $stdErr
     }
 
+    $script:ActiveProcess.Dispose()
     $script:ActiveProcess = $null
     $script:ActiveStdOutTask = $null
     $script:ActiveStdErrTask = $null
     return $result
+}
+
+
+# Run all backup and Git work outside the WPF dispatcher.
+function Invoke-UpdateGit {
+    param([string[]]$GitArguments)
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = 'git.exe'
+    $info.Arguments = '-C ' + (Quote-NativeArgument $RepositoryRoot) + ' ' + (($GitArguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = [Text.Encoding]::UTF8
+    Write-UpdateLog "git $($GitArguments -join ' ')"
+    $proc = [Diagnostics.Process]::Start($info)
+    $stdout = $proc.StandardOutput.ReadToEndAsync()
+    $stderr = $proc.StandardError.ReadToEndAsync()
+    $proc.WaitForExit()
+    $output = $stdout.Result
+    $errors = $stderr.Result
+    $code = $proc.ExitCode
+    $proc.Dispose()
+    Write-UpdateLog "Git exit code: $code. $errors"
+    if ($code -ne 0) { throw "Git failed ($code): $($GitArguments -join ' '). $errors" }
+    return $output
+}
+function Get-GitPaths {
+    param([string[]]$GitArguments)
+    return @((Invoke-UpdateGit $GitArguments).Split([char]0) | Where-Object { $_.Length -gt 0 })
+}
+function Save-Checkpoint {
+    param($Checkpoint)
+    $temp = $script:CheckpointPath + '.tmp'
+    $Checkpoint | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding UTF8
+    if (Test-Path -LiteralPath $script:CheckpointPath) { [IO.File]::Replace($temp, $script:CheckpointPath, ($script:CheckpointPath + '.previous')) }
+    else { [IO.File]::Move($temp, $script:CheckpointPath) }
+    Write-UpdateLog "Stage: $($Checkpoint.Stage)"
+}
+function Assert-RepositoryReady {
+    if ((Invoke-UpdateGit @('ls-files','-u')).Length -gt 0) { throw 'Existing Git conflicts: resolve them and stage the resolutions first. No new update attempted.' }
+    foreach ($operation in @('MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply','sequencer','index.lock')) {
+        $path = (Invoke-UpdateGit @('rev-parse','--git-path',$operation)).Trim()
+        if (-not [IO.Path]::IsPathRooted($path)) { $path = Join-Path $RepositoryRoot $path }
+        if (Test-Path -LiteralPath $path) { throw "Incomplete Git operation: $operation. Complete or abort it manually first." }
+    }
+}
+function Test-GeneratedPath {
+    param([string]$Path)
+    # Preserve plugin binaries and ThirdParty dependencies, custom source and assets.
+    return $Path -match '(^|/)(Intermediate|DerivedDataCache)/' -or $Path -match '^Binaries/'
+}
+function Invoke-RepositoryUpdate {
+    Assert-EditorClosed
+    $builders = @(Get-CimInstance Win32_Process -Filter "Name = 'dotnet.exe' OR Name = 'UnrealBuildTool.exe' OR Name = 'cmd.exe'" -ErrorAction Stop)
+    foreach ($builder in $builders) {
+        if ($builder.CommandLine -and $builder.CommandLine.IndexOf($ProjectFile, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $builder.CommandLine -match 'UnrealBuildTool|Build\.bat') {
+            throw 'A build for this project is still running. Wait for it to exit before continuing.'
+        }
+    }
+    Assert-RepositoryReady
+    $branch = (Invoke-UpdateGit @('branch','--show-current')).Trim()
+    if ($branch -ne $BranchName) { throw "Expected branch $BranchName; found $branch." }
+    $head = (Invoke-UpdateGit @('rev-parse','HEAD')).Trim()
+    $remoteUrl = (Invoke-UpdateGit @('remote','get-url',$RemoteName)).Trim()
+    if (Test-Path -LiteralPath $script:CheckpointPath) {
+        $cp = Get-Content -LiteralPath $script:CheckpointPath -Raw | ConvertFrom-Json
+        if ($cp.Stage -ne 'EditorReady') {
+            if ($cp.Project -ne $ProjectFile -or $cp.Engine -ne $EngineDirectory -or $cp.Repository -ne $RepositoryRoot -or $cp.Branch -ne $branch -or $cp.Remote -ne $RemoteName -or $cp.RemoteUrl -ne $remoteUrl) { throw 'Pending update belongs to a different repository/branch/remote. Review checkpoint manually.' }
+            if ($cp.Stage -eq 'SnapshotReady' -and $head -eq $cp.OriginalRevision) {
+                # Fetch/preflight failed before cleanup began. Retain this recovery
+                # record and snapshot, then safely retry with a fresh backup.
+                Move-Item -LiteralPath $script:CheckpointPath -Destination (Join-Path $cp.Backup 'PreparationCheckpoint.json')
+                Write-UpdateLog 'Retrying preparation; previous backup and snapshot retained.'
+                Invoke-RepositoryUpdate
+                return
+            }
+            if ($cp.Stage -eq 'UpdatingRepository' -and $head -eq $cp.TargetRevision -and $head -ne $cp.OriginalRevision) {
+                $cp.Revision = $head
+                $cp.Stage = 'RepositoryUpdated'
+                Save-Checkpoint $cp
+            }
+            if ($cp.Stage -in @('SnapshotReady','UpdatingRepository')) { throw "Interrupted repository preparation. Recover manually before starting another update. Backup: $($cp.Backup); snapshot: $($cp.Snapshot); checkpoint: $script:CheckpointPath" }
+            if ($cp.Revision -ne $head) { throw 'HEAD changed since the pending update; inspect the checkpoint before resuming.' }
+            if ($cp.Stage -in @('RepositoryUpdated','Restoring','NeedsReview')) {
+                $ack = Join-Path $cp.Backup 'Reviewed.txt'
+                if (-not (Test-Path -LiteralPath $ack)) { throw "Repository updated; restoration needs review. Read $($cp.Backup)\Recovery.txt, reconcile files and stage resolutions, then create $ack and click Continue / retry rebuild. Do not apply the complete snapshot." }
+                $cp.Stage = 'LocalChangesRestored'
+                Save-Checkpoint $cp
+            }
+            Write-UpdateLog "Resuming $($cp.Stage); no repeated download or restoration."
+            return
+        }
+    }
+    $id = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N')
+    $backup = Join-Path $backupBase $id
+    New-Item -ItemType Directory -Path $backup | Out-Null
+    $cp = [pscustomobject]@{ Stage='Preparing'; Repository=$RepositoryRoot; Branch=$branch; Remote=$RemoteName; RemoteUrl=$remoteUrl; Project=$ProjectFile; Engine=$EngineDirectory; OriginalRevision=$head; Revision=$head; TargetRevision=''; Snapshot=''; Backup=$backup; Review=@() }
+    Invoke-UpdateGit @('status','--porcelain=v1','-z','--ignored','--untracked-files=all') | Set-Content -LiteralPath (Join-Path $backup 'Status.txt') -Encoding UTF8
+    Invoke-UpdateGit @('remote','-v') | Set-Content -LiteralPath (Join-Path $backup 'Remotes.txt')
+    $index = (Invoke-UpdateGit @('rev-parse','--git-path','index')).Trim()
+    if (-not [IO.Path]::IsPathRooted($index)) { $index = Join-Path $RepositoryRoot $index }
+    Copy-Item -LiteralPath $index -Destination (Join-Path $backup 'Original.index')
+    $repoPrefix = [IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+    if ([IO.Path]::GetFullPath($backup).StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Backup directory must be outside the repository.' }
+    $files = Join-Path $backup 'Files'
+    # Retain Content backup plus ignored dependencies, mods, configuration and
+    # binaries. Never mirror/delete backup files or follow junctions.
+    & robocopy.exe $RepositoryRoot $files /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /XJ /XD .git /XF .git /NP /NFL /NDL | ForEach-Object { Write-UpdateLog $_ }
+    if ($LASTEXITCODE -ge 8) { throw 'Safety backup failed; no working tree changes made.' }
+    $changed = @(@(Get-GitPaths @('diff','--name-only','--no-renames','-z','HEAD')) + @(Get-GitPaths @('diff','--cached','--name-only','--no-renames','-z','HEAD')) | Select-Object -Unique)
+    $untracked = @(Get-GitPaths @('ls-files','--others','--exclude-standard','-z'))
+    $ignored = @(Get-GitPaths @('ls-files','--others','--ignored','--exclude-standard','-z'))
+    foreach ($path in @($changed + $untracked + $ignored | Select-Object -Unique)) {
+        $local = Join-Path $RepositoryRoot $path
+        if (Test-Path -LiteralPath $local -PathType Leaf) {
+            $copy = Join-Path $files $path
+            if (-not (Test-Path -LiteralPath $copy -PathType Leaf) -or (Get-FileHash -LiteralPath $local).Hash -ne (Get-FileHash -LiteralPath $copy).Hash) { throw "Backup verification failed: $path. No update attempted." }
+        }
+    }
+    $snapshot = (Invoke-UpdateGit @('stash','create',"CrimeFactory update $id")).Trim()
+    if ($changed.Count -gt 0 -and -not $snapshot) { throw 'Tracked snapshot failed.' }
+    if ($snapshot) {
+        $cp.Snapshot = "refs/crimefactory-updates/$id"
+        Invoke-UpdateGit @('update-ref',$cp.Snapshot,$snapshot) | Out-Null
+        if ((Invoke-UpdateGit @('rev-parse',$cp.Snapshot)).Trim() -ne $snapshot) { throw 'Snapshot verification failed.' }
+    }
+    @"
+Original revision: $head
+Snapshot: $($cp.Snapshot) (retained; unrelated stashes untouched).
+Original.index retains staging. Do NOT copy it over the updated index.
+Files\ contains original Content, mods, source, configuration and ignored dependencies.
+Inspect git diff "$($cp.Snapshot)^1" "$($cp.Snapshot)" and staged tree "$($cp.Snapshot)^2".
+Do not apply the entire snapshot over migrated plugins.
+If interrupted during cleanup before Git updated: compare changed paths with Files\ and the snapshot;
+restore/reconcile original work manually (do not blindly apply a partially restored snapshot).
+Once the original work is recovered, move the Git-directory crimefactory-update.json into this
+backup directory and retry the updater. Do not delete the recovery ref or backup.
+A failed download before cleanup retries automatically with another verified backup.
+For restoration review: reconcile the listed paths against Files\, resolve/stage conflicts,
+then create Reviewed.txt here and click Continue / retry rebuild to explicitly accept your resolutions.
+Staging is restored only for paths unchanged upstream; other staging remains in the snapshot/index.
+"@ | Set-Content -LiteralPath (Join-Path $backup 'Recovery.txt')
+    $protectedIndexHash = (Get-FileHash -LiteralPath $index).Hash
+    $cp.Stage = 'SnapshotReady'
+    Save-Checkpoint $cp
+    Invoke-UpdateGit @('fetch',$RemoteName,$BranchName) | Out-Null
+    $target = (Invoke-UpdateGit @('rev-parse','FETCH_HEAD')).Trim()
+    Invoke-UpdateGit @('merge-base','--is-ancestor',$head,$target) | Out-Null
+    Write-UpdateLog "Update download completed: $target"
+    $incoming = @(Get-GitPaths @('ls-tree','-r','--name-only','-z',$target))
+    $incomingSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $incomingDirectories = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $incoming) {
+        [void]$incomingSet.Add($entry)
+        $parent = $entry
+        while ($parent.Contains('/')) {
+            $parent = $parent.Substring(0, $parent.LastIndexOf('/'))
+            [void]$incomingDirectories.Add($parent)
+        }
+    }
+    @('Tracked paths to reconcile if interrupted:') + $changed + @('Untracked/ignored paths (see Files and Status.txt):') + $untracked + $ignored | Add-Content -LiteralPath (Join-Path $backup 'Recovery.txt')
+    $cp.TargetRevision = $target
+    $cp.Stage = 'UpdatingRepository'
+    Save-Checkpoint $cp
+    if ((Get-FileHash -LiteralPath $index).Hash -ne $protectedIndexHash) { throw 'The Git index changed during the update download. Stopped before cleanup.' }
+    foreach ($path in $changed) {
+        $local = Join-Path $RepositoryRoot $path
+        $copy = Join-Path $files $path
+        if ((Test-Path -LiteralPath $local -PathType Leaf) -ne (Test-Path -LiteralPath $copy -PathType Leaf)) { throw "File changed since backup: $path" }
+        if ((Test-Path -LiteralPath $local -PathType Leaf) -and (Get-FileHash -LiteralPath $local).Hash -ne (Get-FileHash -LiteralPath $copy).Hash) { throw "File changed since backup: $path" }
+    }
+    foreach ($path in $changed) {
+        Invoke-UpdateGit @('--literal-pathspecs','restore','--source=HEAD','--staged','--worktree','--',$path) | Out-Null
+    }
+    $review = New-Object 'System.Collections.Generic.List[string]'
+    # Retire plugin roots whose upstream descriptors disappeared. User-authored
+    # extras in those roots are quarantined, not carried into obsolete modules.
+    $oldPlugins = @(Get-GitPaths @('ls-tree','-r','--name-only','-z',$head) | Where-Object { $_ -like 'Plugins/*.uplugin' })
+    $newPluginRoots = @($incoming | Where-Object { $_ -like 'Plugins/*.uplugin' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf('/') + 1) })
+    $retiredRoots = @($oldPlugins | ForEach-Object { $_.Substring(0, $_.LastIndexOf('/') + 1) } | Where-Object { $newPluginRoots -notcontains $_ } | Select-Object -Unique)
+    foreach ($path in @($untracked + $ignored | Select-Object -Unique)) {
+        $collision = $incomingSet.Contains($path) -or $incomingDirectories.Contains($path)
+        $parent = $path
+        while (-not $collision -and $parent.Contains('/')) {
+            $parent = $parent.Substring(0, $parent.LastIndexOf('/'))
+            $collision = $incomingSet.Contains($parent)
+        }
+        $retired = @($retiredRoots | Where-Object { $path.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+        if ($collision -or $retired) {
+            $local = Join-Path $RepositoryRoot $path
+            if (Test-Path -LiteralPath $local -PathType Leaf) {
+                $identical = $false
+                if ($incomingSet.Contains($path)) {
+                    $identical = (Invoke-UpdateGit @('hash-object','--path',$path,'--',$local)).Trim() -eq (Invoke-UpdateGit @('rev-parse',"$($target):$path")).Trim()
+                }
+                if (-not $identical -and -not (Test-GeneratedPath $path)) { $review.Add($path) }
+                if ((Get-FileHash -LiteralPath $local).Hash -ne (Get-FileHash -LiteralPath (Join-Path $files $path)).Hash) { throw "File changed since backup: $path. Stopped without removing it." }
+                Remove-Item -LiteralPath $local
+            }
+        }
+    }
+    Invoke-UpdateGit @('merge','--ff-only',$target) | Out-Null
+    $cp.Revision = (Invoke-UpdateGit @('rev-parse','HEAD')).Trim()
+    $cp.Stage = 'RepositoryUpdated'
+    Save-Checkpoint $cp
+    $cp.Stage = 'Restoring'
+    Save-Checkpoint $cp
+    foreach ($path in $changed) {
+        if (Test-GeneratedPath $path) { continue }
+        $old = Invoke-UpdateGit @('--literal-pathspecs','ls-tree',$head,'--',$path)
+        $new = Invoke-UpdateGit @('--literal-pathspecs','ls-tree',$target,'--',$path)
+        $localTree = Invoke-UpdateGit @('--literal-pathspecs','ls-tree',$snapshot,'--',$path)
+        if ($old -eq $new) {
+            Invoke-UpdateGit @('--literal-pathspecs','restore',"--source=$snapshot",'--worktree','--',$path) | Out-Null
+            Invoke-UpdateGit @('--literal-pathspecs','restore',"--source=$($snapshot)^2",'--staged','--',$path) | Out-Null
+        } elseif ($localTree -eq $new -or (-not $localTree -and -not $new)) {
+            # Never transfer deletion of an old path onto an upstream rename.
+            Write-UpdateLog "Local change already represented upstream: $path"
+        } else { $review.Add($path) }
+    }
+    $cp.Review = @($review | Select-Object -Unique)
+    if ($cp.Review.Count -gt 0) {
+        $cp.Stage = 'NeedsReview'
+        Save-Checkpoint $cp
+        $cp.Review | Add-Content -LiteralPath (Join-Path $backup 'Recovery.txt')
+        throw "Repository updated, but local changes need review: $($cp.Review -join ', '). Originals: $backup. Read Recovery.txt. No snapshot deleted."
+    }
+    $cp.Stage = 'LocalChangesRestored'
+    Save-Checkpoint $cp
+}
+function Assert-EditorClosed {
+    if ($null -ne (Get-Process -Id $EditorPid -ErrorAction SilentlyContinue)) {
+        throw 'The original Unreal Editor is still running. Close it before retrying the rebuild.'
+    }
+    # Detect another editor opened on this project during the update. Fail closed
+    # if process inspection is unavailable rather than cleaning locked binaries.
+    $projectName = [IO.Path]::GetFileName($ProjectFile)
+    $editors = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'UnrealEditor%.exe'" -ErrorAction Stop)
+    foreach ($editor in $editors) {
+        if ([string]::IsNullOrWhiteSpace($editor.CommandLine) -or
+            $editor.CommandLine.IndexOf($projectName, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw 'An Unreal Editor may have this project open. Close it before retrying the rebuild.'
+        }
+    }
+}
+
+
+if ($RepositoryWorker) {
+    try {
+        $gitDirectory = (Invoke-UpdateGit @('rev-parse','--absolute-git-dir')).Trim()
+        $script:CheckpointPath = Join-Path $gitDirectory 'crimefactory-update.json'
+        $workerLock = [IO.File]::Open((Join-Path $gitDirectory 'crimefactory-update-worker.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try { Invoke-RepositoryUpdate } finally { $workerLock.Dispose() }
+        exit 0
+    } catch {
+        Write-UpdateLog "Repository/recovery failed: $($_.Exception.Message)"
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 1
+    }
+}
+
+try {
+    Add-Type -AssemblyName PresentationFramework
+    Add-Type -AssemblyName PresentationCore
+    Add-Type -AssemblyName WindowsBase
+}
+catch {
+    $fatalMessage = "FATAL: Could not load WPF assemblies: $($_.Exception.Message)"
+    Write-BootstrapLog $fatalMessage
+    Write-UpdateLog $fatalMessage
+    exit 10
 }
 
 $windowXaml = @"
@@ -315,9 +586,10 @@ $windowXaml = @"
         </Grid>
         <WrapPanel Grid.Row="4" Name="ButtonPanel" HorizontalAlignment="Right" Visibility="Collapsed" Margin="0,18,0,0">
             <Button Name="CopyReportButton" Content="Copy report"/>
-            <Button Name="OpenBackupButton" Content="Open Content backup" Visibility="Collapsed"/>
+            <Button Name="OpenBackupButton" Content="Open recovery backup" Visibility="Collapsed"/>
             <Button Name="ViewLogButton" Content="View update log"/>
             <Button Name="ReopenButton" Content="Reopen project" Background="#0070E0" Visibility="Collapsed"/>
+            <Button Name="RetryRebuildButton" Content="Continue / retry rebuild" Visibility="Collapsed"/>
             <Button Name="CloseButton" Content="Close"/>
         </WrapPanel>
     </Grid>
@@ -345,6 +617,7 @@ $buttonPanel = $window.FindName('ButtonPanel')
 $openBackupButton = $window.FindName('OpenBackupButton')
 $viewLogButton = $window.FindName('ViewLogButton')
 $reopenButton = $window.FindName('ReopenButton')
+$retryRebuildButton = $window.FindName('RetryRebuildButton')
 $closeButton = $window.FindName('CloseButton')
 
 function Set-Status {
@@ -376,6 +649,7 @@ function Show-Failure {
     $warningText.Text = 'The updater has stopped. Review the message below before reopening the project.'
     Set-Status -Status $Status -Detail $Detail
     $buttonPanel.Visibility = 'Visible'
+    $retryRebuildButton.Visibility = if ($script:RebuildPending) { 'Visible' } else { 'Collapsed' }
 
     if ($script:BackupCreated -and (Test-Path -LiteralPath $script:BackupRoot)) {
         $openBackupButton.Visibility = 'Visible'
@@ -393,6 +667,10 @@ function Show-Failure {
 }
 
 function Start-Editor {
+    if ($script:PullSucceeded -and -not $script:UpdateCompleted) {
+        Write-UpdateLog 'Editor launch blocked: the updated project has not completed its rebuild.'
+        return $false
+    }
     try {
         Write-UpdateLog "Reopening project: $ProjectFile"
 
@@ -430,342 +708,156 @@ function Save-LastBackupPointer {
     }
 }
 
+
 function Start-ContentBackup {
-    try {
-        if (-not (Test-Path -LiteralPath $contentDirectory -PathType Container)) {
-            Write-UpdateLog "No Content directory found at $contentDirectory. Skipping Content backup."
-            Set-Status -Status 'Preparing local changes...' -Detail 'No project Content folder was found, so there was nothing to back up.'
-            Start-GitStatus
-            return
-        }
-
-        $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-        $script:BackupRoot = Join-Path $backupBase $timestamp
-        $script:BackupContentPath = Join-Path $script:BackupRoot 'Content'
-
-        New-Item -ItemType Directory -Path $script:BackupContentPath -Force | Out-Null
-
-        $metadata = @(
-            "PD3 Modkit automatic Content backup",
-            "Created: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-            "Project: $ProjectFile",
-            "Repository: $RepositoryRoot",
-            "Branch: $BranchName"
-        )
-        $metadata | Set-Content -LiteralPath (Join-Path $script:BackupRoot 'BackupInfo.txt') -Encoding UTF8
-
-        $arguments = (Quote-NativeArgument $contentDirectory) + ' ' +
-                     (Quote-NativeArgument $script:BackupContentPath) +
-                     ' /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /XJ /NP /NFL /NDL /NJH'
-
-        Start-ManagedProcess `
-            -FileName 'robocopy.exe' `
-            -Arguments $arguments `
-            -NextState 'BackingUpContent' `
-            -Status 'Backing up project Content...' `
-            -Detail "Creating a safety copy before Git changes anything.`n$($script:BackupContentPath)"
-    }
-    catch {
-        Show-Failure -Status 'Content backup failed.' -Detail "No update was attempted. $($_.Exception.Message)" -CanRetryReopen $true
-    }
+    $script:AllowClose = $false
+    $script:RebuildPending = $false
+    $buttonPanel.Visibility = 'Collapsed'
+    $progressBar.IsIndeterminate = $true
+    $statusText.Foreground = '#FFBC00'
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File ' + (Quote-NativeArgument $PSCommandPath) + ' -ConfigPath ' + (Quote-NativeArgument $ConfigPath) + ' -RepositoryWorker'
+    Start-ManagedProcess -FileName "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Arguments $arguments -NextState 'UpdatingRepository' -Status 'Backing up and updating repository...' -Detail "Preserving local data and staging. Progress and recovery details: $LogPath"
 }
-
-function Finish-ContentBackup {
+function Finish-RepositoryWorker {
     $result = Complete-ActiveProcess
-
-    # Robocopy uses 0-7 for successful/acceptable outcomes. 8+ is failure.
-    if ($result.ExitCode -ge 8) {
-        Show-Failure -Status 'Content backup failed.' -Detail "Robocopy exited with code $($result.ExitCode). No Git update was attempted. Open the update log for details." -CanRetryReopen $true
+    $script:RebuildPending = $true
+    if (Test-Path -LiteralPath $script:CheckpointPath) {
+        $cp = Get-Content -LiteralPath $script:CheckpointPath -Raw | ConvertFrom-Json
+        $script:BackupRoot = $cp.Backup
+        $script:BackupCreated = Test-Path -LiteralPath $cp.Backup
+    }
+    if ($result.ExitCode -ne 0) {
+        Show-Failure -Status 'Repository / local-change recovery needs attention.' -Detail ($result.StdErr + [Environment]::NewLine + "See $LogPath. After recovery, click Continue / retry rebuild.") -CanRetryReopen $false
         return
     }
-
+    $cp = Get-Content -LiteralPath $script:CheckpointPath -Raw | ConvertFrom-Json
+    $script:BackupRoot = $cp.Backup
+    $script:BackupContentPath = Join-Path $cp.Backup 'Files\Content'
     $script:BackupCreated = $true
     Save-LastBackupPointer
-    Write-UpdateLog "Content backup completed: $($script:BackupContentPath)"
-    Start-GitStatus
-}
-
-function Start-GitStatus {
-    try {
-        $arguments = '-C ' + (Quote-NativeArgument $RepositoryRoot) + ' status --porcelain=v1 --untracked-files=all'
-        Start-ManagedProcess `
-            -FileName 'git.exe' `
-            -Arguments $arguments `
-            -NextState 'CheckingLocalChanges' `
-            -Status 'Preparing local changes...' `
-            -Detail 'Checking for uncommitted and untracked files that need to be preserved.'
-    }
-    catch {
-        Show-Failure -Status 'Update failed.' -Detail "Could not inspect the Git working tree: $($_.Exception.Message)" -CanRetryReopen $true
-    }
-}
-
-function Finish-GitStatus {
-    $result = Complete-ActiveProcess
-    if ($result.ExitCode -ne 0) {
-        Show-Failure -Status 'Update failed.' -Detail 'Could not inspect the Git working tree. No update was attempted. Open the update log for details.' -CanRetryReopen $true
-        return
-    }
-
-    if ([string]::IsNullOrWhiteSpace($result.StdOut)) {
-        Write-UpdateLog 'No uncommitted or untracked Git changes detected.'
-        Start-GitPull
-        return
-    }
-
-    Start-GitStash
-}
-
-function Start-GitStash {
-    try {
-        $stashMessage = 'PD3 Modkit Updater Backup ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-        $arguments = '-C ' + (Quote-NativeArgument $RepositoryRoot) +
-                     ' stash push --include-untracked -m ' + (Quote-NativeArgument $stashMessage)
-
-        Start-ManagedProcess `
-            -FileName 'git.exe' `
-            -Arguments $arguments `
-            -NextState 'StashingLocalChanges' `
-            -Status 'Protecting your local changes...' `
-            -Detail 'Temporarily stashing uncommitted tracked and untracked files. They will be restored after the update.'
-    }
-    catch {
-        Show-Failure -Status 'Could not protect local changes.' -Detail "No update was attempted. $($_.Exception.Message)" -CanRetryReopen $true
-    }
-}
-
-function Finish-GitStash {
-    $result = Complete-ActiveProcess
-    if ($result.ExitCode -ne 0) {
-        Show-Failure -Status 'Could not protect local changes.' -Detail 'Git stash failed, so the updater stopped before pulling anything. Your Content backup is safe. Open the log for details.' -CanRetryReopen $true
-        return
-    }
-
-    $script:StashCreated = $true
-    Write-UpdateLog "Local changes stored in $($script:StashName)."
-    Start-GitPull
-}
-
-function Start-GitPull {
-    try {
-        $arguments = '-C ' + (Quote-NativeArgument $RepositoryRoot) +
-                     ' pull --ff-only ' + (Quote-NativeArgument $RemoteName) + ' ' + (Quote-NativeArgument $BranchName)
-
-        Start-ManagedProcess `
-            -FileName 'git.exe' `
-            -Arguments $arguments `
-            -NextState 'Pulling' `
-            -Status 'Downloading and applying the latest update...' `
-            -Detail "Pulling $RemoteName/$BranchName from the official PD3 Modkit repository."
-    }
-    catch {
-        if ($script:StashCreated) {
-            $script:RestoreReason = 'PullFailed'
-            Start-GitRestore
-        }
-        else {
-            Show-Failure -Status 'Update failed.' -Detail "Could not start Git: $($_.Exception.Message)" -CanRetryReopen $true
-        }
-    }
-}
-
-function Finish-GitPull {
-    $result = Complete-ActiveProcess
-
-    if ($result.ExitCode -ne 0) {
-        Write-UpdateLog "git pull failed with exit code $($result.ExitCode)."
-
-        if ($script:StashCreated) {
-            $script:RestoreReason = 'PullFailed'
-            Start-GitRestore
-        }
-        else {
-            Show-Failure -Status 'Update failed.' -Detail "git pull failed with exit code $($result.ExitCode). No local Git changes were stashed. Open the update log for details." -CanRetryReopen $true
-        }
-        return
-    }
-
     $script:PullSucceeded = $true
-    $script:UpdateCompleted = $true
-    Write-UpdateLog 'PD3 Modkit Git update completed successfully.'
-
-    if ($script:StashCreated) {
-        $script:RestoreReason = 'AfterUpdate'
-        Start-GitRestore
-    }
-    else {
-        Complete-UpdateAndScheduleReopen
-    }
+    Start-ProjectRebuild
+}
+function Show-RebuildFailure {
+    param([string]$Message)
+    Show-Failure -Status 'Update applied, but the C++ rebuild failed.' `
+        -Detail "$Message`n`nFull build output: $LogPath`nFix the error and use Retry rebuild; the update will not be downloaded again." `
+        -CanRetryReopen $false
 }
 
-function Start-GitRestore {
-    # The working tree can become dirty again after the user's stash has been
-    # created. Rider/MSBuild/Unreal helper processes can rewrite tracked obj
-    # files or regenerate untracked binaries while Git is pulling. Those files
-    # were created after the user's real changes were safely stashed, so clean
-    # the post-stash working tree before attempting to reapply the user stash.
+function Start-UnrealStage {
+    param([string]$Stage)
+
+    Assert-EditorClosed
+    Assert-RepositoryReady
+    $cp = Get-Content -LiteralPath $script:CheckpointPath -Raw | ConvertFrom-Json
+    if ($cp.Revision -ne (Invoke-UpdateGit @('rev-parse','HEAD')).Trim()) { throw 'HEAD changed during rebuild.' }
+    $cp.Stage = $Stage
+    Save-Checkpoint $cp
+    $buildBatch = Join-Path $EngineDirectory 'Build\BatchFiles\Build.bat'
+    if (-not (Test-Path -LiteralPath $buildBatch -PathType Leaf)) {
+        throw "Unreal Build.bat was not found: $buildBatch"
+    }
+    if (-not (Test-Path -LiteralPath $ProjectFile -PathType Leaf)) {
+        throw "Project file was not found: $ProjectFile"
+    }
+
+    # UBT treats the engine rules as read-only with -UsePrecompiled, including on
+    # source builds. Clean then visits project/plugin outputs, not engine outputs.
+    # UBT resolves all enabled project plugin dependencies from the editor target.
+    $arguments = 'PAYDAY3Editor Win64 Development -Project="%PD3_BUILD_PROJECT%" -architecture=x64 -WaitMutex -UsePrecompiled -NoHotReloadFromIDE -NoEngineChanges'
+    switch ($Stage) {
+        'GeneratingProjectFiles' {
+            $arguments = '-ProjectFiles -Project="%PD3_BUILD_PROJECT%" -Game -UsePrecompiled -WaitMutex'
+            $status = 'Generating project files...'
+        }
+        'CleaningProject' {
+            $arguments += ' -Clean -SkipPreBuildTargets'
+            $status = 'Cleaning project binaries...'
+        }
+        'BuildingProject' { $status = 'Rebuilding C++ modules...' }
+        default { throw "Unknown build stage: $Stage" }
+    }
+    # cmd requires the extra pair of outer quotes for a quoted batch path.
+    Start-ManagedProcess -FileName "$env:SystemRoot\System32\cmd.exe" `
+        -Arguments ('/D /V:OFF /S /C ""%PD3_BUILD_BATCH%" ' + $arguments + '"') `
+        -NextState $Stage -Status $status `
+        -Detail "Engine: $EngineDirectory`nTarget: PAYDAY3Editor / Win64 / Development Editor`nProject: $ProjectFile`n`nThis can take several minutes. Compiler output is captured in the update log when each stage exits.`n$LogPath"
+}
+
+function Start-ProjectRebuild {
+    $script:RebuildPending = $true
+    $script:UpdateCompleted = $false
+    $script:AllowClose = $false
+    $buttonPanel.Visibility = 'Collapsed'
+    $reopenButton.Visibility = 'Collapsed'
+    $statusText.Foreground = '#FFBC00'
+    $progressBar.IsIndeterminate = $true
+    $warningText.Text = 'Please keep Unreal Editor closed until the C++ rebuild completes.'
     try {
-        $arguments = '-C ' + (Quote-NativeArgument $RepositoryRoot) + ' reset --hard HEAD'
-
-        Start-ManagedProcess `
-            -FileName 'git.exe' `
-            -Arguments $arguments `
-            -NextState 'PreparingRestoreReset' `
-            -Status 'Preparing to restore your changes...' `
-            -Detail 'Removing temporary tracked-file changes created while the Modkit was updating.'
+        Assert-EditorClosed
+        Assert-RepositoryReady
+        $cp = Get-Content -LiteralPath $script:CheckpointPath -Raw | ConvertFrom-Json
+        if ($cp.Stage -notin @('LocalChangesRestored','ProjectValidated','GeneratingProjectFiles','CleaningProject','BuildingProject','EditorReady') -or $cp.Revision -ne (Invoke-UpdateGit @('rev-parse','HEAD')).Trim()) { throw 'Repository recovery incomplete or HEAD changed; review checkpoint before rebuilding.' }
+        Get-Content -LiteralPath $ProjectFile -Raw | ConvertFrom-Json | Out-Null
+        $cp.Stage = 'ProjectValidated'
+        Save-Checkpoint $cp
+        Write-UpdateLog "Starting full project rebuild with engine: $EngineDirectory"
+        Start-UnrealStage 'GeneratingProjectFiles'
     }
-    catch {
-        Show-RestoreFailure -Reason $script:RestoreReason -Extra "Could not prepare the working tree for restore. $($_.Exception.Message)"
-    }
+    catch { Show-RebuildFailure $_.Exception.Message }
 }
 
-function Finish-GitRestoreReset {
+function Finish-UnrealStage {
+    $stage = $script:State
     $result = Complete-ActiveProcess
-
     if ($result.ExitCode -ne 0) {
-        Show-RestoreFailure -Reason $script:RestoreReason -Extra "git reset --hard HEAD exited with code $($result.ExitCode). The updater stash has been kept."
+        $output = $result.StdOut + "`n" + $result.StdErr
+        $errors = @($output -split "`r?`n" | Where-Object { $_ -match '(?i)error|exception|failed|fatal' })
+        $diagnostic = if ($errors.Count -gt 0) { ($errors | Select-Object -Last 12) -join "`n" } else { $output.Trim() }
+        if ($diagnostic.Length -gt 5000) { $diagnostic = $diagnostic.Substring($diagnostic.Length - 5000) }
+        Show-RebuildFailure "$stage exited with code $($result.ExitCode).`n$diagnostic"
         return
     }
-
-    Write-UpdateLog 'Post-stash tracked-file changes cleared before restoring the user stash.'
-    Start-GitRestoreClean
-}
-
-function Start-GitRestoreClean {
-    try {
-        $arguments = '-C ' + (Quote-NativeArgument $RepositoryRoot) + ' clean -fd'
-
-        Start-ManagedProcess `
-            -FileName 'git.exe' `
-            -Arguments $arguments `
-            -NextState 'PreparingRestoreClean' `
-            -Status 'Preparing to restore your changes...' `
-            -Detail 'Removing temporary untracked build files created while the Modkit was updating.'
-    }
-    catch {
-        Show-RestoreFailure -Reason $script:RestoreReason -Extra "Could not clean temporary untracked files before restore. $($_.Exception.Message)"
-    }
-}
-
-function Finish-GitRestoreClean {
-    $result = Complete-ActiveProcess
-
-    if ($result.ExitCode -ne 0) {
-        Show-RestoreFailure -Reason $script:RestoreReason -Extra "git clean -fd exited with code $($result.ExitCode). The updater stash has been kept."
-        return
-    }
-
-    Write-UpdateLog 'Post-stash untracked files cleared before restoring the user stash.'
-    Start-GitRestoreApply
-}
-
-function Start-GitRestoreApply {
-    try {
-        $arguments = '-C ' + (Quote-NativeArgument $RepositoryRoot) +
-                     ' stash apply --index ' + (Quote-NativeArgument $script:StashName)
-
-        Start-ManagedProcess `
-            -FileName 'git.exe' `
-            -Arguments $arguments `
-            -NextState 'RestoringLocalChanges' `
-            -Status 'Restoring your local changes...' `
-            -Detail 'Reapplying the uncommitted files that were protected before the update.'
-    }
-    catch {
-        Show-RestoreFailure -Reason $script:RestoreReason -Extra $($_.Exception.Message)
-    }
-}
-
-function Finish-GitRestore {
-    $result = Complete-ActiveProcess
-
-    if ($result.ExitCode -ne 0) {
-        Show-RestoreFailure -Reason $script:RestoreReason -Extra "git stash apply exited with code $($result.ExitCode)."
-        return
-    }
-
-    Write-UpdateLog 'Local changes restored successfully.'
-    Start-GitDropStash
-}
-
-function Start-GitDropStash {
-    try {
-        $arguments = '-C ' + (Quote-NativeArgument $RepositoryRoot) +
-                     ' stash drop ' + (Quote-NativeArgument $script:StashName)
-
-        Start-ManagedProcess `
-            -FileName 'git.exe' `
-            -Arguments $arguments `
-            -NextState 'DroppingUpdaterStash' `
-            -Status 'Finishing update...' `
-            -Detail 'Local changes were restored. Cleaning up the temporary updater stash.'
-    }
-    catch {
-        Write-UpdateLog "Could not drop updater stash: $($_.Exception.Message). The restored changes are still present and the stash has been kept as an extra backup."
-        Finish-AfterRestore
-    }
-}
-
-function Finish-GitDropStash {
-    $result = Complete-ActiveProcess
-
-    if ($result.ExitCode -ne 0) {
-        Write-UpdateLog "Could not drop $($script:StashName). It has been left in the stash list as an additional safety copy."
-    }
-    else {
-        $script:StashCreated = $false
-        Write-UpdateLog 'Temporary updater stash removed after successful restore.'
-    }
-
-    Finish-AfterRestore
-}
-
-function Finish-AfterRestore {
-    if ($script:RestoreReason -eq 'PullFailed') {
-        Show-Failure `
-            -Status 'Update failed, but your local changes were restored.' `
-            -Detail "The Git update did not complete. Your working changes were restored and the Content backup is available at:`n$($script:BackupRoot)" `
-            -CanRetryReopen $true
-        return
-    }
-
-    Complete-UpdateAndScheduleReopen
-}
-
-function Show-RestoreFailure {
-    param(
-        [string]$Reason,
-        [string]$Extra
-    )
-
-    $backupNote = if ($script:BackupCreated) { " A full Content backup is available at: $($script:BackupRoot)." } else { '' }
-
-    if ($Reason -eq 'AfterUpdate') {
-        Show-Failure `
-            -Status 'Update installed, but local changes need manual attention.' `
-            -Detail "The Modkit update succeeded, but Git could not reapply your local changes cleanly. The temporary stash has NOT been deleted and may be partially applied. Resolve the Git conflicts manually before reopening the project.$backupNote $Extra" `
-            -CanRetryReopen $false
-    }
-    else {
-        Show-Failure `
-            -Status 'Update failed and local changes need manual attention.' `
-            -Detail "The update did not complete, and Git could not automatically restore the temporary stash. The stash has NOT been deleted.$backupNote $Extra" `
-            -CanRetryReopen $false
+    Write-UpdateLog "Stage completed: $stage"
+    switch ($stage) {
+        'GeneratingProjectFiles' { Start-UnrealStage 'CleaningProject' }
+        'CleaningProject' { Start-UnrealStage 'BuildingProject' }
+        'BuildingProject' {
+            $cp = Get-Content -LiteralPath $script:CheckpointPath -Raw | ConvertFrom-Json
+            $cp.Stage = 'EditorReady'
+            Save-Checkpoint $cp
+            $script:RebuildPending = $false
+            $script:UpdateCompleted = $true
+            Complete-UpdateAndScheduleReopen
+        }
     }
 }
 
 function Complete-UpdateAndScheduleReopen {
     Save-LastBackupPointer
-    Write-UpdateLog 'PD3 Modkit update and local-change restoration completed successfully.'
+    Write-UpdateLog 'PD3 Modkit update, local-change restoration and full C++ rebuild completed successfully.'
     if ($script:BackupCreated) {
         Write-UpdateLog "Content safety backup: $($script:BackupRoot)"
     }
 
     $statusText.Foreground = '#20DB5D'
-    Set-Status -Status 'Update complete.' -Detail 'Your Content backup is safe and local changes have been restored. Reopening PD3 Modkit...'
+    Set-Status -Status 'Rebuild completed.' -Detail 'The update and full C++ rebuild succeeded. Your local changes have been restored. Reopening PD3 Modkit...'
     $warningText.Text = 'The update was installed successfully. The project will reopen automatically.'
     $script:ReopenAt = [DateTime]::UtcNow.AddMilliseconds(900)
     $script:State = 'ReopenPending'
+}
+
+
+try {
+    $gitDirectory = (Invoke-UpdateGit @('rev-parse','--absolute-git-dir')).Trim()
+    $script:CheckpointPath = Join-Path $gitDirectory 'crimefactory-update.json'
+    $workerProbe = [IO.File]::Open((Join-Path $gitDirectory 'crimefactory-update-worker.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $workerProbe.Dispose()
+    $script:UpdateLock = [IO.File]::Open((Join-Path $gitDirectory 'crimefactory-update.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+} catch {
+    Write-UpdateLog "Cannot acquire updater lock: $($_.Exception.Message)"
+    exit 12
 }
 
 Write-UpdateLog "Updater UI initialized. Waiting for Unreal Editor process $EditorPid to close."
@@ -827,6 +919,8 @@ $reopenButton.Add_Click({
     }
 })
 
+$retryRebuildButton.Add_Click({ Start-ContentBackup })
+
 $closeButton.Add_Click({
     $script:AllowClose = $true
     $window.Close()
@@ -862,51 +956,15 @@ $timer.Add_Tick({
                 }
             }
 
-            'BackingUpContent' {
-                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited) {
-                    Finish-ContentBackup
-                }
+
+            'UpdatingRepository' {
+                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited -and $script:ActiveStdOutTask.IsCompleted -and $script:ActiveStdErrTask.IsCompleted) { Finish-RepositoryWorker }
             }
 
-            'CheckingLocalChanges' {
-                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited) {
-                    Finish-GitStatus
-                }
-            }
-
-            'StashingLocalChanges' {
-                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited) {
-                    Finish-GitStash
-                }
-            }
-
-            'Pulling' {
-                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited) {
-                    Finish-GitPull
-                }
-            }
-
-            'PreparingRestoreReset' {
-                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited) {
-                    Finish-GitRestoreReset
-                }
-            }
-
-            'PreparingRestoreClean' {
-                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited) {
-                    Finish-GitRestoreClean
-                }
-            }
-
-            'RestoringLocalChanges' {
-                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited) {
-                    Finish-GitRestore
-                }
-            }
-
-            'DroppingUpdaterStash' {
-                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited) {
-                    Finish-GitDropStash
+            { $_ -in @('GeneratingProjectFiles', 'CleaningProject', 'BuildingProject') } {
+                if ($null -ne $script:ActiveProcess -and $script:ActiveProcess.HasExited -and
+                    $script:ActiveStdOutTask.IsCompleted -and $script:ActiveStdErrTask.IsCompleted) {
+                    Finish-UnrealStage
                 }
             }
 
@@ -926,11 +984,12 @@ $timer.Add_Tick({
         }
     }
     catch {
-        Show-Failure -Status 'Updater error.' -Detail "$($_.Exception.Message)" -CanRetryReopen $script:UpdateCompleted
+        if ($script:RebuildPending) { Show-RebuildFailure $_.Exception.Message }
+        else { Show-Failure -Status 'Updater error.' -Detail "$($_.Exception.Message)" -CanRetryReopen $script:UpdateCompleted }
     }
 })
 
 $timer.Start()
-[void]$window.ShowDialog()
+try { [void]$window.ShowDialog() } finally { $script:UpdateLock.Dispose() }
 $timer.Stop()
 Write-BootstrapLog 'Updater script exited.'

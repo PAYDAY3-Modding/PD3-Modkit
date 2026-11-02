@@ -16,6 +16,9 @@
 #include "Async/Async.h"
 #include "IUATHelperModule.h"
 #include "Engine/PrimaryAssetLabel.h"
+#include "CollectionManagerModule.h"
+#include "ICollectionManager.h"
+#include "PD3PrimaryAssetLabelValidation.h"
 #include "EditorAssetLibrary.h"
 #include "Editor.h"
 #include "Subsystems/EditorAssetSubsystem.h"
@@ -46,9 +49,17 @@
 #include "ContentBrowserModule.h"
 #include "IContentBrowserSingleton.h"
 #include "Interfaces/IPluginManager.h"
+#include "Interfaces/IProjectManager.h"
+#include "ProjectDescriptor.h"
 #include "Brushes/SlateDynamicImageBrush.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "InputCoreTypes.h"
+#include "Slate.h"
+#include "PropertyEditorModule.h"
+#include "IDetailsView.h"
 
 #define LOCTEXT_NAMESPACE "CrimeFactoryModListEntry"
 
@@ -536,6 +547,7 @@ namespace
 	FString ClassifyPackagingFailure(
 		const FCrimeFactoryUATResult& Result)
 	{
+        if (Result.Phase == TEXT("Archive mod")) return TEXT("Archiving");
         if (Result.Phase == TEXT("Export ZIP")) return TEXT("ZIP export");
 		const FString Combined =
 			Result.Phase +
@@ -640,6 +652,8 @@ namespace
 		const FString& Category,
 		const FCrimeFactoryUATResult& Result)
 	{
+        if (Category == TEXT("Archiving"))
+            return TEXT("Cooking and staging finished, but archiving failed. Check the selected utility and Executable Path in CrimeFactory Project Settings, destination permissions, disk space, and the archive command output. The standard ZIP may still be available in Saved/ArchivedPlugins.");
         if (Category == TEXT("ZIP export"))
             return TEXT("The normal ZIP remains in Saved/ArchivedPlugins. Check the Additional ZIP Export Folder in CrimeFactory settings, available disk space, permissions, and whether the destination ZIP is open in another application.");
 
@@ -892,6 +906,99 @@ namespace
 		);
 	}
 
+    struct FCrimeFactoryPALReferences
+    {
+        TArray<FSoftObjectPath> Assets;
+        TArray<FSoftObjectPath> Blueprints;
+        TArray<FSoftObjectPath> Directory;
+        TArray<FString> Errors;
+        TArray<FString> Warnings;
+    };
+
+    // Resolve sources at use time. Never materialize collection members in the PAL.
+    FCrimeFactoryPALReferences ResolvePALReferences(const UPrimaryAssetLabel& Label)
+    {
+        FCrimeFactoryPALReferences Result;
+        for (const auto& Asset : Label.ExplicitAssets)
+            if (!Asset.IsNull()) Result.Assets.AddUnique(Asset.ToSoftObjectPath());
+        for (const auto& Blueprint : Label.ExplicitBlueprints)
+        {
+            const FSoftObjectPath ClassPath = Blueprint.ToSoftObjectPath();
+            if (ClassPath.IsNull()) continue;
+            // _C is an object suffix, never part of the owning Blueprint package.
+            if (ClassPath.GetLongPackageName().StartsWith(TEXT("/Script/")))
+            {
+                Result.Warnings.Add(TEXT("PAL native class is not a cookable Blueprint package: ") + ClassPath.ToString());
+                continue;
+            }
+            Result.Blueprints.AddUnique(ClassPath);
+        }
+        IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+        if (Label.bLabelAssetsInMyDirectory)
+        {
+            TArray<FAssetData> DirectoryAssets;
+            Registry.GetAssetsByPath(FName(*FPackageName::GetLongPackagePath(Label.GetOutermost()->GetName())), DirectoryAssets, true);
+            for (const FAssetData& Asset : DirectoryAssets)
+                if (Label.bIncludeRedirectors || !Asset.IsRedirector()) Result.Directory.AddUnique(Asset.GetSoftObjectPath());
+        }
+        const FName CollectionName = Label.AssetCollection.CollectionName;
+        if (CollectionName.IsNone()) return Result;
+        ICollectionManager& Collections = FCollectionManagerModule::GetModule().Get();
+        TArray<FCollectionNameType> Matches;
+        // UE5.5 FCollectionReference stores only the name. Match native PAL's CST_All semantics.
+        Collections.GetCollections(CollectionName, Matches);
+        if (Matches.IsEmpty())
+        {
+            Result.Errors.Add(FString::Printf(TEXT("PAL %s references missing collection '%s'."), *Label.GetPathName(), *CollectionName.ToString()));
+            return Result;
+        }
+        for (const FCollectionNameType& Match : Matches)
+        {
+            ECollectionStorageMode::Type StorageMode;
+            if (!Collections.GetCollectionStorageMode(Match.Name, Match.Type, StorageMode))
+            {
+                Result.Errors.Add(TEXT("Cannot resolve collection storage mode: ") + Match.Name.ToString());
+                continue;
+            }
+            if (StorageMode == ECollectionStorageMode::Dynamic)
+            {
+                // Native PAL GetAssetsInCollection cannot evaluate Content Browser search queries.
+                // Fail explicitly rather than accepting an apparently empty, incomplete mod.
+                Result.Errors.Add(FString::Printf(TEXT("Collection '%s' (%s) is dynamic. UE5.5 PALs require a static collection; dynamic search results cannot be used as a deterministic native PAL source."), *Match.Name.ToString(), ECollectionShareType::ToString(Match.Type)));
+                continue;
+            }
+            TArray<FSoftObjectPath> Members;
+            Collections.GetAssetsInCollection(Match.Name, Match.Type, Members, ECollectionRecursionFlags::Self);
+            for (const FSoftObjectPath& Member : Members)
+            {
+                if (UE::PD3CookedEditor::PrimaryAssetLabels::IsCookedReference(Member))
+                {
+                    const FString Warning = FString::Printf(TEXT("Collection '%s': cooked asset excluded from forging: %s"), *Match.Name.ToString(), *Member.ToString());
+                    Result.Warnings.Add(Warning);
+                    UE_LOG(LogCrimeFactory, Warning, TEXT("%s"), *Warning);
+                    continue;
+                }
+                const FString PackageName = Member.GetLongPackageName();
+                if (!FPackageName::IsValidLongPackageName(PackageName) || PackageName.StartsWith(TEXT("/Script/"))
+                    || !DoesSoftReferencePackageExist(Member))
+                {
+                    Result.Errors.Add(FString::Printf(TEXT("Collection '%s' member cannot resolve to a cookable package: %s"), *Match.Name.ToString(), *Member.ToString()));
+                    continue;
+                }
+                const FAssetData Asset = Registry.GetAssetByObjectPath(Member);
+                if (Asset.IsRedirector() && !Label.bIncludeRedirectors) continue;
+                // Package existence alone is not proof that a referenced object is valid.
+                if (!Asset.IsValid())
+                {
+                    Result.Errors.Add(FString::Printf(TEXT("Collection '%s' has an invalid asset reference: %s"), *Match.Name.ToString(), *Member.ToString()));
+                    continue;
+                }
+                Result.Assets.AddUnique(Member);
+            }
+        }
+        return Result;
+    }
+
 	struct FCrimeFactoryPALInspectionData
 	{
 		FString PluginName;
@@ -919,6 +1026,8 @@ namespace
 		TArray<FString> ExternalGameAssets;
 		TArray<FString> ManagedChunkCandidates;
 		TArray<FString> MissingExplicitReferences;
+        TArray<FString> ResolutionErrors;
+        TArray<FString> ResolutionWarnings;
 	};
 
 	void AddUniqueInspectionPath(
@@ -1006,6 +1115,9 @@ namespace
 		if (Label)
 		{
 			Data.bPALFound = true;
+            const auto Resolved = ResolvePALReferences(*Label);
+            Data.ResolutionErrors = Resolved.Errors;
+            Data.ResolutionWarnings = Resolved.Warnings;
 			Data.bRuntimeLabel =
 				Label->bIsRuntimeLabel;
 			Data.bLabelAssetsInMyDirectory =
@@ -1022,20 +1134,18 @@ namespace
 
 			if (Data.bLabelAssetsInMyDirectory)
 			{
-				for (const FString& PluginAsset :
-					Data.PluginAssets)
+				for (const FSoftObjectPath& PluginAsset : Resolved.Directory)
 				{
 					AddUniqueInspectionPath(
 						Data.ManagedChunkCandidates,
-						PluginAsset);
+						PluginAsset.ToString());
 				}
 			}
 
-			for (const TSoftObjectPtr<UObject>& ExplicitAsset :
-				Label->ExplicitAssets)
+			for (const FSoftObjectPath& ExplicitAsset : Resolved.Assets)
 			{
 				const FSoftObjectPath AssetPath =
-					ExplicitAsset.ToSoftObjectPath();
+					ExplicitAsset;
 
 				if (AssetPath.IsNull())
 				{
@@ -1081,11 +1191,10 @@ namespace
 				}
 			}
 
-			for (const TSoftClassPtr<UObject>& ExplicitBlueprint :
-				Label->ExplicitBlueprints)
+			for (const FSoftObjectPath& ExplicitBlueprint : Resolved.Blueprints)
 			{
 				const FSoftObjectPath AssetPath =
-					ExplicitBlueprint.ToSoftObjectPath();
+					ExplicitBlueprint;
 
 				if (AssetPath.IsNull())
 				{
@@ -1554,6 +1663,8 @@ namespace
         View->ExternalAssetCount = Data.ExternalAssets.Num() + Data.ExternalBlueprints.Num();
         View->bCanFix = HasAutoFixablePALInspectionWarnings(Data);
         View->Issues = GetPALInspectionIssues(Data);
+        for (const FString& Error : Data.ResolutionErrors) View->Issues.Add(Error);
+        for (const FString& Warning : Data.ResolutionWarnings) View->Issues.Add(Warning);
         for (const FString& Path : Data.MissingExplicitReferences) View->MissingPaths.Add(Path);
         View->InformationReport = Summary;
         View->AssetsReport = BuildPALAssetReport(Data);
@@ -1613,7 +1724,8 @@ namespace
 
 		if (!PackageName.IsEmpty())
 		{
-			PackageNames.AddUnique(PackageName);
+			if (!PackageNames.ContainsByPredicate([&PackageName](const FString& Existing) { return Existing.Equals(PackageName, ESearchCase::IgnoreCase); }))
+                PackageNames.Add(PackageName);
 		}
 	}
 
@@ -1762,8 +1874,10 @@ namespace
 
 		if (FPaths::IsRelative(Root))
 		{
+			const FString AbsoluteContentDir =
+				FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
 			Root = FPaths::ConvertRelativePathToFull(
-				FPaths::ProjectContentDir(),
+				AbsoluteContentDir,
 				Root);
 		}
 
@@ -1901,8 +2015,8 @@ namespace
 				CleanRelative.RightChopInline(1, EAllowShrinking::No);
 			}
 
-			const FString Source =
-				FPaths::Combine(PlatformRoot, CleanRelative);
+			const FString Source = FPaths::ConvertRelativePathToFull(
+				FPaths::Combine(PlatformRoot, CleanRelative));
 			const FString StagedPath =
 				FString(TEXT("PAYDAY3/Content/WwiseAudio/")) + CleanRelative;
 
@@ -2099,6 +2213,12 @@ namespace
 	{
 		const FCrimeFactoryPALInspectionData Data =
 			BuildPALInspectionData(Plugin);
+
+        if (!Data.ResolutionErrors.IsEmpty())
+        {
+            for (const FString& Error : Data.ResolutionErrors) UE_LOG(LogCrimeFactory, Error, TEXT("%s"), *Error);
+            return false;
+        }
 
 		if (!Data.bPALFound)
 		{
@@ -2324,63 +2444,8 @@ namespace
 			return INDEX_NONE;
 		}
 
-		bool bHasExternalContent = false;
-
-		// Explicit Assets can point outside /<PluginName>/ and are the main
-		// mechanism used for /Game replacement assets.
-		for (const TSoftObjectPtr<UObject>& ExplicitAsset : Label->ExplicitAssets)
-		{
-			const FSoftObjectPath AssetPath =
-				ExplicitAsset.ToSoftObjectPath();
-
-			if (IsOutsidePluginMount(AssetPath, PluginMountPath))
-			{
-				UE_LOG(
-					LogCrimeFactory,
-					Display,
-					TEXT(
-						"PAL %s manages external asset %s. "
-						"Two-stage cook is required."
-					),
-					*PALPath,
-					*AssetPath.ToString()
-				);
-
-				bHasExternalContent = true;
-				break;
-			}
-		}
-
-		// Explicit Blueprints are a separate PAL list in UE5. Treat them the
-		// same way so class replacements outside the plugin also trigger pass 2.
-		if (!bHasExternalContent)
-		{
-			for (const TSoftClassPtr<UObject>& ExplicitBlueprint :
-				Label->ExplicitBlueprints)
-			{
-				const FSoftObjectPath AssetPath =
-					ExplicitBlueprint.ToSoftObjectPath();
-
-				if (IsOutsidePluginMount(
-					AssetPath,
-					PluginMountPath))
-				{
-					UE_LOG(
-						LogCrimeFactory,
-						Display,
-						TEXT(
-							"PAL %s manages external blueprint %s. "
-							"Two-stage cook is required."
-						),
-						*PALPath,
-						*AssetPath.ToString()
-					);
-
-					bHasExternalContent = true;
-					break;
-				}
-			}
-		}
+        const auto Data = BuildPALInspectionData(Plugin);
+        const bool bHasExternalContent = !Data.ExternalAssets.IsEmpty() || !Data.ExternalBlueprints.IsEmpty();
 
 		if (!bHasExternalContent)
 		{
@@ -2388,8 +2453,7 @@ namespace
 				LogCrimeFactory,
 				Display,
 				TEXT(
-					"PAL %s contains no Explicit Assets or Explicit "
-					"Blueprints outside %s. Skipping PASS 2 and using "
+					"PAL %s contains no resolved references outside %s. Skipping PASS 2 and using "
 					"the normal plugin DLC cook only."
 				),
 				*PALPath,
@@ -2484,7 +2548,8 @@ namespace
 			TEXT("CrimeFactory.Automation.csproj"),
 			TEXT("CrimeFactory.Automation.csproj.props"),
 			TEXT("Packaging/PackagePlugin.cs"),
-            TEXT("Packaging/CrimeFactoryZipExport.cs")
+            TEXT("Packaging/CrimeFactoryZipExport.cs"),
+            TEXT("Packaging/CrimeFactoryArchive.cs")
 		};
 
 		for (const TCHAR* SourceFile : SourceFiles)
@@ -2521,7 +2586,8 @@ namespace
 			TEXT("CrimeFactory.Automation.csproj"),
 			TEXT("CrimeFactory.Automation.csproj.props"),
 			TEXT("Packaging/PackagePlugin.cs"),
-            TEXT("Packaging/CrimeFactoryZipExport.cs")
+            TEXT("Packaging/CrimeFactoryZipExport.cs"),
+            TEXT("Packaging/CrimeFactoryArchive.cs")
 		};
 
 		uint32 Fingerprint = 2166136261u;
@@ -2888,6 +2954,37 @@ namespace
 
 }
 
+
+FReply SCrimeFactoryModEntry::OnMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& Event)
+{
+    // Child buttons keep their normal clicks. The card background and title can be dragged.
+    if (Event.GetEffectingButton() == EKeys::LeftMouseButton)
+        return FReply::Handled().DetectDrag(SharedThis(this), EKeys::LeftMouseButton);
+    return SCompoundWidget::OnMouseButtonDown(Geometry, Event);
+}
+
+FReply SCrimeFactoryModEntry::OnDragDetected(const FGeometry&, const FPointerEvent&)
+{
+    if (auto Pinned = Owner.Pin(); Pinned && Mod.IsValid()) return Pinned->BeginModDrag(Mod.ToSharedRef());
+    return FReply::Unhandled();
+}
+
+FReply SCrimeFactoryModEntry::OnMouseButtonUp(const FGeometry& Geometry, const FPointerEvent& Event)
+{
+    if (Event.GetEffectingButton() != EKeys::RightMouseButton || !Mod.IsValid())
+        return SCompoundWidget::OnMouseButtonUp(Geometry, Event);
+    FMenuBuilder Menu(true, nullptr);
+    Menu.AddMenuEntry(LOCTEXT("ModContextContent", "Open in Content Browser"), FText::GetEmpty(), FSlateIcon(),
+        FUIAction(FExecuteAction::CreateLambda([Weak = TWeakPtr<SCrimeFactoryModEntry>(SharedThis(this))] { if (auto Entry = Weak.Pin()) Entry->OnOpenModContent(); })));
+    Menu.AddMenuEntry(LOCTEXT("ModContextInformation", "Information"), FText::GetEmpty(), FSlateIcon(),
+        FUIAction(FExecuteAction::CreateLambda([Weak = TWeakPtr<SCrimeFactoryModEntry>(SharedThis(this))] { if (auto Entry = Weak.Pin()) Entry->OnOpenInformation(); })));
+    Menu.AddMenuEntry(LOCTEXT("ModContextConfig", "Configure"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SCrimeFactoryModEntry::OnEditMod)));
+    Menu.AddMenuEntry(LOCTEXT("ModContextForge", "Forge"), FText::GetEmpty(), FSlateIcon(),
+        FUIAction(FExecuteAction::CreateLambda([Weak = TWeakPtr<SCrimeFactoryModEntry>(SharedThis(this))] { if (auto Entry = Weak.Pin()) Entry->PackageMod({}); })));
+    if (auto Pinned = Owner.Pin()) Pinned->AddMoveToFolderMenu(Menu, Mod.ToSharedRef());
+    FSlateApplication::Get().PushMenu(SharedThis(this), FWidgetPath(), Menu.MakeWidget(), Event.GetScreenSpacePosition(), FPopupTransitionEffect::ContextMenu);
+    return FReply::Handled();
+}
 
 void SCrimeFactoryModEntry::Construct(
 	const FArguments& Args,
@@ -3858,15 +3955,17 @@ FCrimeFactoryPreflightResult SCrimeFactoryModEntry::CollectPreflightResult() con
 			Result.Warning(TEXT("PAL is not marked as a runtime label."));
 		}
 
+        const auto Resolved = ResolvePALReferences(*Label);
+        for (const FString& Error : Resolved.Errors) Result.Error(Error);
+        for (const FString& Warning : Resolved.Warnings) Result.Warning(Warning);
 		int32 ExternalAssetCount = 0;
 		int32 ExternalBlueprintCount = 0;
 		int32 MissingExplicitReferenceCount = 0;
 
-		for (const TSoftObjectPtr<UObject>& ExplicitAsset :
-			Label->ExplicitAssets)
+		for (const FSoftObjectPath& ExplicitAsset : Resolved.Assets)
 		{
 			const FSoftObjectPath AssetPath =
-				ExplicitAsset.ToSoftObjectPath();
+				ExplicitAsset;
 
 			if (AssetPath.IsNull())
 			{
@@ -3892,11 +3991,10 @@ FCrimeFactoryPreflightResult SCrimeFactoryModEntry::CollectPreflightResult() con
 			}
 		}
 
-		for (const TSoftClassPtr<UObject>& ExplicitBlueprint :
-			Label->ExplicitBlueprints)
+		for (const FSoftObjectPath& ExplicitBlueprint : Resolved.Blueprints)
 		{
 			const FSoftObjectPath AssetPath =
-				ExplicitBlueprint.ToSoftObjectPath();
+				ExplicitBlueprint;
 
 			if (AssetPath.IsNull())
 			{
@@ -4074,6 +4172,17 @@ void SCrimeFactoryModEntry::PackageMod(const TArray<TSharedPtr<SCrimeFactoryModE
         for (const auto& Item : Result.Items)
             Combined.Add(Item.Severity, Batch->Entries.Num() > 1 ? Name + TEXT(" - ") + Item.Message : Item.Message);
     }
+    const UCrimeFactorySettings* ArchiveSettings = UCrimeFactorySettings::Get();
+    if (ArchiveSettings->bCreateUtilityArchive)
+    {
+        const bool bSevenZip = ArchiveSettings->ArchiveUtility == ECrimeFactoryArchiveUtility::SevenZip;
+        const FString Executable = (bSevenZip ? ArchiveSettings->SevenZipExecutablePath : ArchiveSettings->WinRARExecutablePath).FilePath.TrimStartAndEnd();
+        if (Executable.IsEmpty() || Executable.Contains(TEXT("\"")) || Executable.Contains(TEXT("\r")) || Executable.Contains(TEXT("\n"))
+            || !FPaths::GetExtension(Executable).Equals(TEXT("exe"), ESearchCase::IgnoreCase)
+            || !IFileManager::Get().FileExists(*Executable))
+            Combined.Error(FString::Printf(TEXT("%s executable is missing or invalid: %s. Configure its Executable Path in CrimeFactory Project Settings."),
+                bSevenZip ? TEXT("7-Zip") : TEXT("WinRAR"), *Executable));
+    }
     const FString Export = UCrimeFactorySettings::Get()->ZipExportDirectory.Path.TrimStartAndEnd();
     if (!Export.IsEmpty())
     {
@@ -4129,6 +4238,27 @@ void SCrimeFactoryModEntry::PackageMod(const TArray<TSharedPtr<SCrimeFactoryModE
     }
 
     FString AdditionalUATArguments;
+    if (Settings->bCreateUtilityArchive)
+    {
+        const bool bSevenZip = Settings->ArchiveUtility == ECrimeFactoryArchiveUtility::SevenZip;
+        const FString Executable = (bSevenZip ? Settings->SevenZipExecutablePath : Settings->WinRARExecutablePath).FilePath.TrimStartAndEnd();
+        // Validate again: settings may have changed while the batch was cooking.
+        if (Executable.IsEmpty() || Executable.Contains(TEXT("\"")) || Executable.Contains(TEXT("\r")) || Executable.Contains(TEXT("\n"))
+            || !FPaths::GetExtension(Executable).Equals(TEXT("exe"), ESearchCase::IgnoreCase)
+            || !IFileManager::Get().FileExists(*Executable))
+        {
+            FCrimeFactoryPackagingFailure Failure;
+            Failure.PluginName = PluginName;
+            Failure.Phase = TEXT("Archive configuration");
+            Failure.Message = FString::Printf(TEXT("%s executable is missing or invalid: %s"), bSevenZip ? TEXT("7-Zip") : TEXT("WinRAR"), *Executable);
+            Failure.Suggestion = TEXT("Configure the selected utility's Executable Path in CrimeFactory Project Settings.");
+            CrimeFactoryPackagingUI::ShowFailure(Failure);
+            return;
+        }
+        AdditionalUATArguments += FString::Printf(TEXT("-CreateUtilityArchive -ArchiveUtility=%s -ArchiveExecutable=\"%s\" "),
+            bSevenZip ? TEXT("SevenZip") : TEXT("WinRAR"), *FPaths::ConvertRelativePathToFull(Executable));
+    }
+
     if (!Batch->ZipExportDirectory.IsEmpty())
         AdditionalUATArguments += FString::Printf(TEXT("-ZipExportDir=\"%s\" "), *Batch->ZipExportDirectory);
 
@@ -4556,6 +4686,30 @@ FReply SCrimeFactoryModEntry::OnDeleteMod()
         RootMountPath,
         PluginContentDir);
 
+    // Default-enabled mods normally have no .uproject entry. Remove an
+    // explicit override if one exists, so it cannot require this deleted mod
+    // when a separate cook/UAT process or a later editor session starts.
+    IProjectManager& ProjectManager = IProjectManager::Get();
+    const FProjectDescriptor* Project = ProjectManager.GetCurrentProject();
+    if (Project && Project->Plugins.ContainsByPredicate(
+        [&PluginName](const FPluginReferenceDescriptor& Reference)
+        {
+            return Reference.Name.Equals(PluginName, ESearchCase::IgnoreCase);
+        }))
+    {
+        FText ProjectSaveFailure;
+        if (!ProjectManager.RemovePluginReference(PluginName, ProjectSaveFailure) ||
+            !ProjectManager.SaveCurrentProjectToDisk(ProjectSaveFailure))
+        {
+            UE_LOG(LogCrimeFactory, Error,
+                TEXT("Deleted mod %s, but could not save removal of its project plugin reference: %s. Make the project descriptor writable and save the project before packaging."),
+                *PluginName, *ProjectSaveFailure.ToString());
+            FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(FString::Printf(
+                TEXT("Mod '%s' was deleted, but its project plugin reference could not be saved. Make the project descriptor writable and save the project before packaging.\n\n%s"),
+                *PluginName, *ProjectSaveFailure.ToString())));
+        }
+    }
+
     // Remove the saved checkbox selection for the deleted mod.
     if (UCrimeFactorySettings* Settings = UCrimeFactorySettings::Get())
     {
@@ -4565,9 +4719,10 @@ FReply SCrimeFactoryModEntry::OnDeleteMod()
 
     /*
      * Remove the deleted descriptor from PluginManager's discovered list and
-     * refresh discovery. The content mount may remain alive until editor
-     * restart if assets from the mod were already loaded, but it will no
-     * longer exist on disk or in CrimeFactory's list.
+     * refresh discovery. UE refuses removal of enabled plugins, and refresh
+     * intentionally retains them. Do not force-unload assets/modules here.
+     * Asset Manager registration is already gone; packaging independently
+     * validates loaded receipt dependencies before UAT staging.
      */
     FText RemovePluginFailReason;
     if (!IPluginManager::Get().RemoveFromPluginsList(
@@ -4579,7 +4734,8 @@ FReply SCrimeFactoryModEntry::OnDeleteMod()
             Warning,
             TEXT(
                 "Mod %s was deleted from disk, but PluginManager could not "
-                "remove its descriptor from the current in-memory list: %s"
+                "remove its descriptor from the current in-memory list: %s. "
+                "CrimeFactory will validate receipt references before staging; no restart is required for that cleanup."
             ),
             *PluginName,
             *RemovePluginFailReason.ToString());
@@ -4670,3 +4826,4 @@ int32 UCrimeFactoryPALCommandlet::Main(const FString& Params)
 	}
 	return WritePALPackagingManifest(*Plugin, ChunkId, Output) ? 0 : 1;
 }
+

@@ -1,6 +1,9 @@
 ﻿#include "Settings/CrimeFactorySettings.h"
 
 #include "Misc/ConfigCacheIni.h"
+#include "HAL/FileManager.h"
+#include "HAL/PlatformMisc.h"
+#include "Misc/Paths.h"
 #include "UObject/UnrealType.h"
 
 #if __has_include("PD3CookedEditorSettings.h")
@@ -35,6 +38,24 @@ namespace
         return Property && GConfig->GetString(Section, Name, Value, Filename)
             && Property->ImportText_InContainer(*Value, Settings, Settings, PPF_None) != nullptr;
     }
+}
+
+UCrimeFactorySettings::UCrimeFactorySettings()
+{
+    // Config loading follows construction, so saved paths always override detection.
+    auto DetectExecutable = [](const TCHAR* RelativePath, const TCHAR* DefaultPath)
+    {
+        for (const TCHAR* Variable : {TEXT("ProgramW6432"), TEXT("ProgramFiles"), TEXT("ProgramFiles(x86)")})
+        {
+            const FString Root = FPlatformMisc::GetEnvironmentVariable(Variable);
+            if (Root.IsEmpty()) continue;
+            const FString Candidate = FPaths::Combine(Root, RelativePath);
+            if (IFileManager::Get().FileExists(*Candidate)) return Candidate;
+        }
+        return FString(DefaultPath);
+    };
+    WinRARExecutablePath.FilePath = DetectExecutable(TEXT("WinRAR/WinRAR.exe"), TEXT("C:/Program Files/WinRAR/WinRAR.exe"));
+    SevenZipExecutablePath.FilePath = DetectExecutable(TEXT("7-Zip/7z.exe"), TEXT("C:/Program Files/7-Zip/7z.exe"));
 }
 
 UCrimeFactorySettings* UCrimeFactorySettings::Get()
@@ -136,3 +157,4 @@ void UCrimeFactorySettings::SaveSettings()
         GConfig->Flush(false, GEditorPerProjectIni);
     }
 }
+

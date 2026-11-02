@@ -20,6 +20,11 @@
             "Name": "CrimeFactory",
             "Type": "Editor",
             "LoadingPhase": "Default"
+        },
+        {
+            "Name": "CrimeFactoryEditorVisualizers",
+            "Type": "EditorNoCommandlet",
+            "LoadingPhase": "PostEngineInit"
         }
     ],
     "Plugins": [

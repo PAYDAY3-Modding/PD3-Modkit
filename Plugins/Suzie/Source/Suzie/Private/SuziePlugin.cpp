@@ -1,4 +1,7 @@
 #include "SuziePlugin.h"
+#include "SuzieReflectionMetadata.h"
+#include "SuzieNativeFunctions.h"
+#include "SuzieNativeLifecycle.h"
 #include "HeistAuthoring.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonReader.h"
@@ -857,7 +860,11 @@ void FSuziePluginModule::StartupModule()
         }
     }
 
+    RegisterGeneratedSuzieNativeFunctions();
+    SuzieNativeLifecycle::Start();
     ProcessAllJsonClassDefinitions();
+    SuzieNative::FinishBindings();
+    SuzieNativeLifecycle::FinishBindings();
 
     SuzieHeistAuthoring::RegisterEditorHooks();
 
@@ -893,6 +900,8 @@ void FSuziePluginModule::StartupModule()
 
 void FSuziePluginModule::ShutdownModule()
 {
+    SuzieNative::Reset();
+    SuzieNativeLifecycle::Reset();
     SuzieHeistAuthoring::UnregisterEditorHooks();
     if (GSuziePostEngineInitHandle.IsValid())
     {
@@ -1024,6 +1033,7 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     // Create class generation context
     FDynamicClassGenerationContext ClassGenerationContext;
     ClassGenerationContext.GlobalObjectMap = *Objects;
+    ClassGenerationContext.MetadataOverrides = SuzieReflectionMetadata::LoadOverrides();
 
     // Create classes, script structs and global delegate functions
     for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
@@ -1086,6 +1096,10 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     {
         FinalizeClass(ClassGenerationContext, ClassPendingFinalization);
     }
+
+    // A function can be encountered before its owning class's properties are constructed.
+    // Validate bodies only once every class in this JMAP has its final layout and CDO.
+    SuzieNative::BindAvailable();
 
     // Audit after every reflected type in this jmap exists. Existing native
     // engine/plugin types are never mutated here.
@@ -1188,6 +1202,12 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
         {TEXT("CLASS_CollapseCategories"), CLASS_CollapseCategories},
         {TEXT("CLASS_Const"), CLASS_Const},
         {TEXT("CLASS_DefaultToInstanced"), CLASS_DefaultToInstanced},
+        // This flag gates instancing of templates during UObject construction.
+        // StaticLink does not reconstruct the UHT class flag for native classes.
+        {TEXT("CLASS_HasInstancedReference"), CLASS_HasInstancedReference},
+        {TEXT("CLASS_Hidden"), CLASS_Hidden},
+        {TEXT("CLASS_HideDropDown"), CLASS_HideDropDown},
+        {TEXT("CLASS_Deprecated"), CLASS_Deprecated},
         {TEXT("CLASS_Interface"), CLASS_Interface},
     };
 
@@ -1227,7 +1247,7 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
 
     //Set super structure and ClassWithin (they are required prior to registering)
     ConstructedClassObject->SetSuperStruct(ParentClass);
-    ConstructedClassObject->ClassWithin = UObject::StaticClass();
+    ConstructedClassObject->ClassWithin = ParentClass->ClassWithin;
     // UE 5.5+ generates TotalFieldCount during UStruct::Link/StaticLink.
     // Do not write the internal TotalFieldCount field directly; newer engine
     // versions deprecate that API and StaticLink() below is the authoritative
@@ -3340,11 +3360,9 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     }
 
     // Mark all dynamic classes as blueprintable and blueprint types, otherwise we will not be able to use them.
-    // ShowWorldContextPin recreates UCLASS(meta=(ShowWorldContextPin)) behaviour that
-    // was previously supplied by generated headers rather than the runtime jmap.
     NewClass->SetMetaData(FBlueprintMetadata::MD_AllowableBlueprintVariableType, TEXT("true"));
     NewClass->SetMetaData(FBlueprintMetadata::MD_IsBlueprintBase, TEXT("true"));
-    NewClass->SetMetaData(FBlueprintMetadata::MD_ShowWorldContextPin, TEXT("true"));
+    SuzieReflectionMetadata::ApplyClass(NewClass, ClassDefinition, Context.MetadataOverrides);
 
     if (NewClass->IsChildOf<UActorComponent>())
     {
@@ -3479,6 +3497,7 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     static const TArray<TPair<FString, EStructFlags>> StructFlagNameLookup = {
         {TEXT("STRUCT_Atomic"), STRUCT_Atomic},
         {TEXT("STRUCT_Immutable"), STRUCT_Immutable},
+        {TEXT("STRUCT_HasInstancedReference"), STRUCT_HasInstancedReference},
     };
 
     // Convert struct flag names to the struct flags bitmask.
@@ -3634,6 +3653,11 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     // Check if we have already created this enum
     if (UEnum* ExistingEnum = FindObject<UEnum>(nullptr, *EnumPath))
     {
+        const TSharedPtr<FJsonObject>* Definition = nullptr;
+        if (Context.GlobalObjectMap->TryGetObjectField(EnumPath, Definition))
+        {
+            SuzieReflectionMetadata::ApplyEnum(ExistingEnum, *Definition, Context.MetadataOverrides);
+        }
         return ExistingEnum;
     }
     if (!IsSuzieReconstructibleScriptPath(EnumPath))
@@ -3675,8 +3699,14 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
         if (EnumNameAndValueArray.Num() == 2)
         {
             const FString EnumConstantName = EnumNameAndValueArray[0]->AsString();
-            // TODO: Using numbers to represent enumeration values is not safe, large int64 values cannot be adequately represented as json double precision numbers
-            const int64 EnumConstantValue = EnumNameAndValueArray[1]->AsNumber();
+            // String values also allow future dumps to preserve int64 values beyond
+            // JSON double precision. Never replace explicit values with entry indices.
+            int64 EnumConstantValue = 0;
+            if (!EnumNameAndValueArray[1]->TryGetNumber(EnumConstantValue))
+            {
+                UE_LOG(LogSuzie, Error, TEXT("Invalid enum value for %s"), *EnumConstantName);
+                continue;
+            }
 
             EnumNames.Add({FName(*EnumConstantName), EnumConstantValue});
             bContainsFullyQualifiedNames |= EnumConstantName.Contains(TEXT("::"));
@@ -3699,6 +3729,7 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
 
     // We do not need to generate _MAX key because it will always be present in the enum definition
     NewEnum->SetEnums(EnumNames, EnumCppForm, EnumFlags, false);
+    SuzieReflectionMetadata::ApplyEnum(NewEnum, EnumDefinition, Context.MetadataOverrides);
     NewEnum->SetMetaData(TEXT("SuzieDynamicEnum"), TEXT("true"));
 
     // Mark all dynamic enums as blueprint types
@@ -3947,11 +3978,6 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
         if (Property->IsA<FObjectProperty>() && (Property->GetFName() == TEXT("WorldContext") || Property->GetFName() == TEXT("WorldContextObject")))
         {
             NewFunction->SetMetaData(FBlueprintMetadata::MD_WorldContext, *Property->GetName());
-
-            // jmap does not carry UHT metadata. Keep these functions callable from
-            // generated UObject/subsystem Blueprint parents; ShowWorldContextPin on
-            // the class makes the otherwise-hidden context pin explicit.
-            NewFunction->SetMetaData(FBlueprintMetadata::MD_CallableWithoutWorldContext, TEXT("true"));
         }
         // Latent Info struct parameter properties should always be tagged as LatentInfo and indicate async BP functions
         if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property); StructProperty && StructProperty->Struct == FLatentActionInfo::StaticStruct())
@@ -3960,6 +3986,12 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
             NewFunction->SetMetaData(FBlueprintMetadata::MD_Latent, TEXT("true"));
         }
     }
+
+    // Captured metadata (including nonstandard WorldContext parameter names,
+    // HidePin, DefaultToSelf and CallableWithoutWorldContext) overrides the legacy
+    // parameter-name fallbacks above. Never declare every context-dependent
+    // function safe to call without a world merely to make it appear in a menu.
+    SuzieReflectionMetadata::ApplyFunction(NewFunction, FunctionDefinition, Context.MetadataOverrides);
 
     // Class-owned functions are discovered when their UClass is registered.
     // Package-owned functions (typically delegate signatures) have no class parent,
@@ -4400,6 +4432,55 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         }
     }
 
+    SuzieReflectionMetadata::ApplyProperty(NewProperty, PropertyJson, Context.MetadataOverrides);
+    if (NewProperty->HasMetaData(TEXT("Bitmask")))
+    {
+        const FNumericProperty* Numeric = CastField<FNumericProperty>(NewProperty);
+        FString EnumPath = NewProperty->GetMetaData(TEXT("BitmaskEnum"));
+        if (!EnumPath.IsEmpty() && !EnumPath.StartsWith(TEXT("/")))
+        {
+            // UHT metadata can contain a short enum name. Resolve that explicit
+            // symbol only when it is unique; never infer from the property name.
+            FString ResolvedPath;
+            for (const auto& Entry : Context.GlobalObjectMap->Values)
+            {
+                const TSharedPtr<FJsonObject> Definition = Entry.Value->AsObject();
+                if (Definition->GetStringField(TEXT("type")) == TEXT("Enum")
+                    && (Entry.Key.EndsWith(TEXT(".") + EnumPath)
+                        || Definition->GetStringField(TEXT("cpp_type")) == EnumPath))
+                {
+                    if (!ResolvedPath.IsEmpty())
+                    {
+                        ResolvedPath.Reset();
+                        break;
+                    }
+                    ResolvedPath = Entry.Key;
+                }
+            }
+            if (!ResolvedPath.IsEmpty())
+            {
+                EnumPath = ResolvedPath;
+                NewProperty->SetMetaData(TEXT("BitmaskEnum"), *EnumPath);
+            }
+        }
+        // Metadata changes only the stock Property Editor control, never the FProperty
+        // type, storage, flags, defaults, or enum values. Do not infer associations.
+        UEnum* MaskEnum = EnumPath.StartsWith(TEXT("/")) ? FindObject<UEnum>(nullptr, *EnumPath) : nullptr;
+        if (!EnumPath.IsEmpty() && Context.GlobalObjectMap->HasTypedField<EJson::Object>(EnumPath)
+            && Context.GlobalObjectMap->GetObjectField(EnumPath)->GetStringField(TEXT("type")) == TEXT("Enum"))
+        {
+            MaskEnum = FindOrCreateEnum(Context, EnumPath);
+        }
+        if (!Numeric || !Numeric->IsInteger() || CastField<FEnumProperty>(NewProperty)
+            || (CastField<FByteProperty>(NewProperty) && CastField<FByteProperty>(NewProperty)->Enum)
+            || (!EnumPath.IsEmpty() && !MaskEnum))
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("Ignoring invalid bitmask metadata on %s (enum '%s'); use a full enum object path"),
+                *NewProperty->GetPathName(), *EnumPath);
+            NewProperty->RemoveMetaData(TEXT("Bitmask"));
+            NewProperty->RemoveMetaData(TEXT("BitmaskEnum"));
+        }
+    }
     return NewProperty;
 }
 
@@ -4805,6 +4886,36 @@ namespace
             SubobjectMap.Add(Template, Instance && Instance->IsA(Template->GetClass()) ? Instance : nullptr);
         }, true);
 
+        // Missing game-native constructors also assign owner properties to their
+        // default subobjects (for example SplineComponent = RootComponent). Creating
+        // the subobject alone does not perform that assignment. The general defaults
+        // copy deliberately skips instanced/exported properties, and UE's native fast
+        // path assumes the C++ constructor already initialized these references.
+        // Reconnect only explicit native-template references to existing local DSOs.
+        // Never copy a CDO pointer or duplicate an unrelated instanced object graph.
+        // Archetype/serialized Blueprint overrides are applied after construction.
+        for (TFieldIterator<FObjectProperty> It(NativeClass); It; ++It)
+        {
+            FObjectProperty* Property = *It;
+            for (int32 Index = 0; Index < Property->ArrayDim; ++Index)
+            {
+                UObject* Template = Property->GetObjectPropertyValue(
+                    Property->ContainerPtrToValuePtr<void>(NativeCDO, Index));
+                UObject* const* Local = SubobjectMap.Find(Template);
+                if (!Template || Template == NativeCDO || !Local || !*Local
+                    || !(*Local)->IsA(Property->PropertyClass))
+                {
+                    continue;
+                }
+                void* Value = Property->ContainerPtrToValuePtr<void>(Object, Index);
+                UObject* Current = Property->GetObjectPropertyValue(Value);
+                if (Current == nullptr || Current == Template)
+                {
+                    Property->SetObjectPropertyValue(Value, *Local);
+                }
+            }
+        }
+
         for (const TPair<UObject*, UObject*>& Pair : SubobjectMap)
         {
             if (Pair.Key == NativeCDO || Pair.Value == nullptr)
@@ -5001,6 +5112,12 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
     for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
     {
         ExecutePolymorphicClassConstructorFrameForDynamicClass(ObjectInitializer, DynamicClassHierarchyTree[i]);
+    }
+    // Callbacks see initialized Suzie/native-parent storage, scoped to their declaring
+    // class (not Blueprint-added fields). JMAP/archetype copies below still win.
+    for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
+    {
+        SuzieNativeLifecycle::InitializeClass(*ConstructedObject, *DynamicClassHierarchyTree[i]);
     }
 
     InitializeSuzieActorSubobjectDefaults(ConstructedObject, TopLevelDynamicClass);
@@ -5469,6 +5586,16 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
 
     // Recursively deserialize property values for the default object and its subobjects (and their nested subobjects)
     DeserializeObjectAndSubobjectPropertyValuesRecursive(Context, ClassDefaultObject, ClassDefaultObjectDefinition);
+
+    // Match BlueprintEditorUtils' GetWorld check using the fully initialized CDO.
+    // Actors, level scripts, components and other world-aware native bases can
+    // supply self automatically. Only classes without that support need the
+    // explicit-pin fallback. Preserve source/inherited ShowWorldContextPin.
+    if (ClassDefaultObject && !ClassDefaultObject->ImplementsGetWorld()
+        && !Class->HasMetaDataHierarchical(FBlueprintMetadata::MD_ShowWorldContextPin))
+    {
+        Class->SetMetaData(FBlueprintMetadata::MD_ShowWorldContextPin, TEXT("true"));
+    }
 
     if (Class->GetPathName() == TEXT("/Script/Starbreeze.SBZInteractableDoor"))
     {

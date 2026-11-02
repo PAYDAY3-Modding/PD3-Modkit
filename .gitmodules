@@ -1,0 +1,4 @@
+[submodule "Mods/JukeboxMod"]
+	path = Mods/JukeboxMod
+	url = https://github.com/braidy08/JukeboxMod.git
+	branch = master

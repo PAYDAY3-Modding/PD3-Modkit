@@ -13,10 +13,14 @@
 #include "Misc/Paths.h"
 #include "Async/Async.h"
 #include "Widgets/Layout/SWrapBox.h"
+#include "ModBrowser/CrimeFactoryModOrganisation.h"
 
 #define LOCTEXT_NAMESPACE "CrimeFactoryModListEntry"
 
 void SCrimeFactoryModEntryList::Construct(const FArguments& Args) {
+    Organisation = MakeShared<FCrimeFactoryModOrganisation>();
+    FText OrganisationError;
+    if (!Organisation->Load(OrganisationError)) ShowOrganisationError(OrganisationError);
     ChildSlot[
         SNew(SVerticalBox)
 
@@ -94,17 +98,7 @@ void SCrimeFactoryModEntryList::Construct(const FArguments& Args) {
         .FillHeight(1.0f)
         .Padding(FMargin(0.0f, 1.0f, 0.0f, 0.0f))
         [
-            SNew(SScrollBox)
-            .Orientation(Orient_Vertical)
-            .ScrollBarAlwaysVisible(true)
-
-            + SScrollBox::Slot()
-            [
-                SAssignNew(ModGrid, SWrapBox)
-                .UseAllottedSize(true)
-                .InnerSlotPadding(FVector2D(4.0f, 4.0f))
-                .HAlign(HAlign_Left)
-            ]
+            MakeOrganisationBrowser()
         ]
     ];
 
@@ -286,6 +280,10 @@ void SCrimeFactoryModEntryList::LoadMods() {
     });
     RefreshStatus = LoadErrors ? FText::Format(LOCTEXT("RefreshProblems", "{0} mod(s). {1} refresh problem(s); see Output Log. New code plugins may require an editor restart."), Mods.Num(), LoadErrors)
         : FText::Format(LOCTEXT("RefreshCount", "{0} mod(s) discovered."), Mods.Num());
+    TMap<FString, FString> Descriptors;
+    for (const auto& Mod : Mods) Descriptors.Add(FCrimeFactoryModOrganisation::ModKey(*Mod), Mod->GetDescriptorFileName());
+    if (Organisation->ReconcileDescriptors(Descriptors)) SaveOrganisation();
+    CachedEntries.Reset();
     Filter(LastFilter);
 }
 
@@ -320,7 +318,7 @@ void SCrimeFactoryModEntryList::Filter(const FString& InFilter) {
     LastFilter = InFilter;
     FilteredMods.Empty();
 
-    if (InFilter.IsEmpty()) {
+    if (InFilter.TrimStartAndEnd().IsEmpty()) {
         FilteredMods = Mods;
     } else {
         // tokenize filter keywords
@@ -336,7 +334,7 @@ void SCrimeFactoryModEntryList::Filter(const FString& InFilter) {
         }
     }
 
-    RebuildModGrid();
+    RefreshFolderContents();
 }
 
 void SCrimeFactoryModEntryList::RebuildModGrid()
@@ -349,14 +347,44 @@ void SCrimeFactoryModEntryList::RebuildModGrid()
     }
 
     ModGrid->ClearChildren();
+    const bool bSearching = !LastFilter.TrimStartAndEnd().IsEmpty();
+    TSet<FString> FoldersWithMatches;
+    if (bSearching)
+    {
+        // Mark ancestors once per matching mod instead of scanning every mod for every tile.
+        for (const auto& Mod : FilteredMods)
+        {
+            FString Folder = Organisation->FolderForMod(FCrimeFactoryModOrganisation::ModKey(*Mod));
+            while (const auto* Node = Organisation->Find(Folder))
+            {
+                if (FoldersWithMatches.Contains(Folder)) break;
+                FoldersWithMatches.Add(Folder);
+                Folder = Node->Parent;
+            }
+        }
+    }
+
+    // Folder tiles share the same drop handling as the sidebar rows.
+    const FString Parent = Organisation->CurrentFolder == FCrimeFactoryModOrganisation::AllMods
+        ? FString() : Organisation->CurrentFolder;
+    for (const auto& Folder : Organisation->Children(Parent))
+    {
+        const bool bMatchesSearch = !bSearching || Folder.Name.Contains(LastFilter) || FoldersWithMatches.Contains(Folder.Id);
+        if (bMatchesSearch) AddFolderTile(Folder.Id);
+    }
 
     for (const TSharedRef<IPlugin>& Mod : FilteredMods)
     {
-        TSharedRef<SCrimeFactoryModEntry> Entry =
-            SNew(
-                SCrimeFactoryModEntry,
-                Mod,
-                SharedThis(this));
+        const FString Key = FCrimeFactoryModOrganisation::ModKey(*Mod);
+        const FString Assigned = Organisation->FolderForMod(Key);
+        if (Organisation->CurrentFolder != FCrimeFactoryModOrganisation::AllMods &&
+            !(bSearching ? Organisation->IsWithin(Assigned, Organisation->CurrentFolder) : Assigned == Organisation->CurrentFolder))
+        {
+            continue;
+        }
+        TSharedPtr<SCrimeFactoryModEntry>& Cached = CachedEntries.FindOrAdd(Key);
+        if (!Cached.IsValid()) Cached = SNew(SCrimeFactoryModEntry, Mod, SharedThis(this));
+        TSharedRef<SCrimeFactoryModEntry> Entry = Cached.ToSharedRef();
 
         VisibleEntries.Add(Entry);
 
@@ -365,6 +393,12 @@ void SCrimeFactoryModEntryList::RebuildModGrid()
         [
             Entry
         ];
+    }
+    if (ModGrid->GetChildren()->Num() == 0)
+    {
+        ModGrid->AddSlot().Padding(8)
+        [ SNew(STextBlock).Text(bSearching ? LOCTEXT("NoFolderMatches", "No mods match this search in the selected folder.")
+            : LOCTEXT("EmptyVirtualFolder", "This virtual folder is empty.")).AutoWrapText(true) ];
     }
 }
 

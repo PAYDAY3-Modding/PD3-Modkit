@@ -5,6 +5,13 @@
 #include "CrimeFactorySettings.generated.h"
 
 UENUM()
+enum class ECrimeFactoryArchiveUtility : uint8
+{
+    WinRAR = 0 UMETA(DisplayName = "WinRAR"),
+    SevenZip = 1 UMETA(DisplayName = "7-Zip"),
+};
+
+UENUM()
 enum class ECrimeFactoryStartGameType : uint8 {
     NONE = 0 UMETA(DisplayName = "Do not launch"),
     STEAM = 1 UMETA(DisplayName = "Steam"),
@@ -23,6 +30,7 @@ class CRIMEFACTORY_API UCrimeFactorySettings : public UObject
     GENERATED_BODY()
 
 public:
+    UCrimeFactorySettings();
     static UCrimeFactorySettings* Get();
     void SaveSettings();
     static void OnCookedEditorSettingsChanged(UObject* Object, FPropertyChangedEvent& Event);
@@ -42,6 +50,18 @@ public:
 
     UPROPERTY(EditAnywhere, Config, Category = "General|Export", meta = (DisplayName = "Additional ZIP Export Folder", ToolTip = "Optional extra ZIP destination, with a subfolder per platform. The standard Saved/ArchivedPlugins archive is always retained. Relative paths are resolved from the project directory."))
     FDirectoryPath ZipExportDirectory;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Archiving", meta = (DisplayName = "Create RAR / 7z Archive", ToolTip = "Create an additional distributable archive beside the standard ZIP in Saved/ArchivedPlugins. Requires only the selected utility."))
+    bool bCreateUtilityArchive = false;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Archiving", meta = (DisplayName = "Archive Utility"))
+    ECrimeFactoryArchiveUtility ArchiveUtility = ECrimeFactoryArchiveUtility::WinRAR;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Archiving", meta = (DisplayName = "WinRAR Executable Path", FilePathFilter = "exe"))
+    FFilePath WinRARExecutablePath;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Archiving", meta = (DisplayName = "7-Zip Executable Path", FilePathFilter = "exe"))
+    FFilePath SevenZipExecutablePath;
 
     /* Internal state ----------------------------------------------------------------------- */
 

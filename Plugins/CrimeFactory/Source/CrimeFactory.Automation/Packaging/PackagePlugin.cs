@@ -22,6 +22,9 @@ namespace CrimeFactory.Automation
 		public string GameDirectory;
 		public string LaunchGameType;
         public string ZipExportDirectory;
+        public bool CreateUtilityArchive;
+        public string ArchiveUtility = "WinRAR";
+        public string ArchiveExecutable;
 	}
 
 	internal sealed class CrimeFactoryPALPackagingManifest
@@ -36,6 +39,10 @@ namespace CrimeFactory.Automation
 			new List<string>();
 		public List<CrimeFactoryAdditionalPakFile> AdditionalPakFiles { get; } =
 			new List<CrimeFactoryAdditionalPakFile>();
+		// PASS 2 uses a small cooker command line plus a disk-backed package list.
+		// Keep both locations so we can prove the request reached the cooker.
+		public string Pass2PackageManifestFile { get; set; } = "";
+		public string Pass2CommandFile { get; set; } = "";
 	}
 
 	internal sealed class CrimeFactoryAdditionalPakFile
@@ -1084,6 +1091,8 @@ namespace CrimeFactory.Automation
 				manifest.ExpectedChunkPackages)
 			{
 				if (string.IsNullOrWhiteSpace(packageName) ||
+				    packageName.Any(character => char.IsWhiteSpace(character) ||
+				        character == '+' || character == '"' || character == '=' || character == '\0') ||
 				    !packageName.StartsWith(
 					    "/",
 					    StringComparison.Ordinal))
@@ -1122,11 +1131,14 @@ namespace CrimeFactory.Automation
 			 * contains the complete package set that is allowed into the chunk.
 			 *
 			 * -cooksinglepackagenorefs tells CookCommandlet to save only packages
-			 * supplied explicitly on the command line. Referenced vanilla PAYDAY 3
+			 * supplied explicitly in the startup workload. Referenced vanilla PAYDAY 3
 			 * packages remain imports instead of becoming unsolicited cook targets.
 			 *
-			 * CookCommandlet accepts package names through -Map even when they are
-			 * not UWorld assets, so seed the full deterministic PAL package set.
+			 * UE 5.5's BlockOnPrebootCookGate accepts -Package tokens through
+			 * -CookWaitOnCommandFile and adds them directly to StartupOptions.CookMaps.
+			 * Unlike -CmdLineFile, this never expands into FCommandLine's fixed
+			 * 16,384-character buffer (or Windows' 32,767-character process limit).
+			 * This file is prepared before launch and consumed/deleted by FLockFile.
 			 */
 			/*
 			 * Do not add -CookSinglePackage here. Wwise recognizes that flag and
@@ -1135,10 +1147,73 @@ namespace CrimeFactory.Automation
 			 * generated BNK/WEM files itself, so PASS 2 only needs the exact AkEvent
 			 * UObject plus the rest of the deterministic PAL package set.
 			 */
-			return " -cooksinglepackagenorefs -Map=" +
-				string.Join(
-					"+",
-					exactPackages);
+			string commandDirectory = Path.Combine(
+				Path.GetDirectoryName(Path.GetFullPath(manifest.SourceFile)),
+				"CookInputs");
+			Directory.CreateDirectory(commandDirectory);
+
+			// This human-readable manifest remains on disk after the cook for
+			// diagnostics. Every line is a validated long package name.
+			string packageManifestFile = Path.Combine(commandDirectory,
+				"Pass2-Chunk" + manifest.ChunkId + "-Packages.manifest");
+			var utf8 = new System.Text.UTF8Encoding(false);
+			File.WriteAllLines(packageManifestFile, exactPackages, utf8);
+			manifest.Pass2PackageManifestFile = packageManifestFile;
+
+			// UE 5.5's preboot cook gate consumes -Package=<LongPackageName>
+			// requests from its command file. The transient command file MUST be
+			// created before launching UnrealEditor-Cmd; FLockFile deletes it after
+			// consuming the requests. A GUID prevents stale requests from previous
+			// runs being silently reused.
+			string commandFile = Path.Combine(commandDirectory,
+				"Pass2-" + Guid.NewGuid().ToString("N") + ".txt");
+			File.WriteAllLines(commandFile,
+				exactPackages.Select(packageName => "-Package=" + packageName),
+				utf8);
+			manifest.Pass2CommandFile = commandFile;
+
+			LogInformation(
+				"PASS 2: wrote {0} exact packages to manifest: {1}",
+				exactPackages.Count, packageManifestFile);
+			LogInformation(
+				"PASS 2: cook command file (preboot gate): {0}",
+				commandFile);
+
+			// No package names are added to the process command line. UAT
+			// trims outer whitespace from AdditionalCookerOptions, so the
+			// filename is followed by another real flag.
+			return " -CookWaitOnCommandFile=" +
+				CommandUtils.MakePathSafeToUseWithCommandLine(commandFile) +
+				" -cooksinglepackagenorefs";
+		}
+
+
+		private static void EnsurePass2CookInputWasConsumed(
+			CrimeFactoryPALPackagingManifest manifest)
+		{
+			if (manifest == null ||
+			    string.IsNullOrWhiteSpace(manifest.Pass2CommandFile))
+			{
+				throw new AutomationException(
+					"PASS 2 has no cook command file. Refusing to stage an unverified chunk.");
+			}
+
+			// The preboot gate removes the file once the cooker has read it.
+			// A remaining file means that the cook command ignored the input,
+			// even if it returned a success code (for example by cooking defaults).
+			if (File.Exists(manifest.Pass2CommandFile))
+			{
+				throw new AutomationException(
+					"PASS 2 cook returned without consuming its exact-package command file: {0}. "
+					+ "Verify that this UE 5.5 cooker supports -CookWaitOnCommandFile; "
+					+ "CrimeFactory will not package a potentially incorrect chunk. "
+					+ "Requested package names are preserved in: {1}",
+					manifest.Pass2CommandFile,
+					manifest.Pass2PackageManifestFile);
+			}
+
+			LogInformation("PASS 2: verified cooker consumed package input ({0}).",
+				manifest.Pass2PackageManifestFile);
 		}
 
 		private static string NormalizeManifestLine(
@@ -1364,12 +1439,51 @@ namespace CrimeFactory.Automation
 			);
 		}
 
+		// These are SavePackage2's explicit non-runtime results, not generic
+		// missing-package warnings, load failures or NeverCook policy rejections.
+		private static string GetEditorOnlyCookPath(string line)
+		{
+			string[] prefixes = {
+				"LogSavePackage: Verbose: No exports found (or all exports are editor-only) for ",
+				"LogSavePackage: Verbose: Package marked as editor-only: "
+			};
+			const string suffix = ". Package will not be saved.";
+			foreach (string prefix in prefixes)
+			{
+				int start = line.IndexOf(prefix, StringComparison.Ordinal);
+				if (start >= 0 && line.EndsWith(suffix, StringComparison.Ordinal))
+					return line.Substring(start + prefix.Length,
+						line.Length - start - prefix.Length - suffix.Length);
+			}
+			return null;
+		}
+
+		private static string FindExactPass2CookLog(ProjectParams chunkParams)
+		{
+			string inputId = System.Text.RegularExpressions.Regex.Match(
+				chunkParams.AdditionalCookerOptions, @"Pass2-[a-f0-9]{32}\.txt").Value;
+			string logFolder = Environment.GetEnvironmentVariable("uebp_LogFolder");
+			if (!string.IsNullOrEmpty(inputId) && Directory.Exists(logFolder))
+			{
+				foreach (string path in Directory.GetFiles(logFolder, "Cook*.txt")
+					.OrderByDescending(File.GetLastWriteTimeUtc))
+					if (File.ReadAllText(path).Contains(inputId, StringComparison.Ordinal))
+						return path;
+			}
+			throw new AutomationException("Cannot find the current PASS 2 cook log for {0}. Refusing to infer runtime exclusions.", inputId);
+		}
+
 		private static void EnsureExpectedPackagesInChunkManifest(
 			ProjectParams chunkParams,
 			CrimeFactoryPALPackagingManifest manifest,
 			string pluginName,
 			int chunkId)
 		{
+			string cookLog = FindExactPass2CookLog(chunkParams);
+			var editorOnlyPaths = File.ReadLines(cookLog).Select(GetEditorOnlyCookPath)
+				.Where(path => path != null).ToList();
+			var editorOnlyPackages = new List<string>();
+			int requestedCount = manifest.ExpectedChunkPackages.Count;
 			string manifestDirectory =
 				GetChunkManifestDirectory(chunkParams);
 
@@ -1477,6 +1591,13 @@ namespace CrimeFactory.Automation
 
 				if (packageLines.Count == 0)
 				{
+					if (!manifest.ExternalCookPackages.Contains(expectedPackage, StringComparer.OrdinalIgnoreCase) &&
+						editorOnlyPaths.Any(path => ManifestLineMatchesPackage(path, expectedPackage, pluginName)))
+					{
+						editorOnlyPackages.Add(expectedPackage);
+						LogInformation("PASS 2: cooker explicitly excluded non-runtime package: {0}", expectedPackage);
+						continue;
+					}
 					missingFromCook.Add(
 						expectedPackage);
 
@@ -1495,6 +1616,14 @@ namespace CrimeFactory.Automation
 				);
 			}
 
+			// Preserve the original PAL JSON and record every runtime decision separately.
+			File.WriteAllText(manifest.SourceFile + ".RuntimeAudit.json", JsonSerializer.Serialize(new {
+				PluginName = pluginName, CookLog = cookLog, RequestedCount = requestedCount,
+				EditorOnlyPackages = editorOnlyPackages, MissingPackages = missingFromCook,
+				CookedPackages = manifest.ExpectedChunkPackages.Except(editorOnlyPackages, StringComparer.OrdinalIgnoreCase)
+					.Except(missingFromCook, StringComparer.OrdinalIgnoreCase).ToList()
+			}, new JsonSerializerOptions { WriteIndented = true }));
+
 			if (missingFromCook.Count > 0)
 			{
 				throw new AutomationException(
@@ -1506,6 +1635,7 @@ namespace CrimeFactory.Automation
 						missingFromCook)
 				);
 			}
+			manifest.ExpectedChunkPackages.RemoveAll(package => editorOnlyPackages.Contains(package, StringComparer.OrdinalIgnoreCase));
 
 			exactSelectedLines =
 				exactSelectedLines
@@ -1619,6 +1749,7 @@ namespace CrimeFactory.Automation
 				+ "-ini:Editor:[CookSettings]:CookContentMissingSeverity=Warning "
 				+ "-ini:Engine:[Core.Log]:LogAudiokineticTools=Fatal "
 				+ "-ini:Engine:[Core.Log]:LogBinkMoviePlayer=Fatal "
+				+ "-ini:Engine:[Core.Log]:LogSavePackage=Verbose "
 
 				+ BuildExactPass2CookOptions(palManifest);
 
@@ -1853,7 +1984,8 @@ namespace CrimeFactory.Automation
 		internal static void CopyBuildToStagingDirectory(
 			ProjectParams Params,
 			IReadOnlyList<DeploymentContext> deploymentContexts,
-			IEnumerable<CrimeFactoryAdditionalPakFile> additionalPakFiles = null)
+			IEnumerable<CrimeFactoryAdditionalPakFile> additionalPakFiles = null,
+			FileReference activeModDescriptor = null)
 		{
 			var platformCares =
 				Params.ClientTargetPlatformInstances[0].RequiresPak(Params);
@@ -1870,6 +2002,8 @@ namespace CrimeFactory.Automation
 
 				foreach (var sc in deploymentContexts)
 				{
+					CrimeFactoryPluginStaging.Validate(
+						Params.RawProjectPath, sc, activeModDescriptor ?? Params.DLCFile);
 					Project.CreateStagingManifest(Params, sc);
 					StageAdditionalPakFiles(sc, additionalPakFiles);
 					Project.CleanStagingDirectory(Params, sc);
@@ -2755,7 +2889,8 @@ namespace CrimeFactory.Automation
 			ProjectParams dlcParams,
 			string workingPluginDirectory,
 			string pluginName,
-			string finalCookPlatform)
+			string finalCookPlatform,
+            PD3Params pd3Params)
 		{
 			var baseArchiveDirectory = CombinePaths(
 				Path.GetDirectoryName(
@@ -2786,11 +2921,20 @@ namespace CrimeFactory.Automation
 				zipFilePath
 			);
 
+            CreateUtilityArchive(workingPluginDirectory, zipFilePath, pd3Params);
+
 			LogInformation(
 				"Archived two-stage plugin: {0}",
 				zipFilePath
 			);
 		}
+
+        private static void CreateUtilityArchive(string source, string zipPath, PD3Params settings)
+        {
+            if (!settings.CreateUtilityArchive) return;
+            CrimeFactoryArchive.Create(source, Path.ChangeExtension(zipPath, CrimeFactoryArchive.Extension(settings.ArchiveUtility)),
+                settings.ArchiveUtility, settings.ArchiveExecutable, message => LogInformation("{0}", message));
+        }
 
         private static void ExportArchivedZip(ProjectParams projectParams, PD3Params pd3Params,
             string platform, string pluginName)
@@ -2829,7 +2973,8 @@ namespace CrimeFactory.Automation
 
 		private static void ArchivePluginProject(
 			ProjectParams projectParams,
-			IEnumerable<DeploymentContext> deploymentContexts)
+			IEnumerable<DeploymentContext> deploymentContexts,
+            PD3Params pd3Params)
 		{
 			var baseArchiveDirectory = CombinePaths(
 				Path.GetDirectoryName(
@@ -2873,6 +3018,7 @@ namespace CrimeFactory.Automation
 					stagePluginDirectory,
 					zipFilePath
 				);
+                CreateUtilityArchive(stagePluginDirectory, zipFilePath, pd3Params);
 			}
 		}
 
@@ -2994,7 +3140,8 @@ namespace CrimeFactory.Automation
 				result.SetPhase("Archive mod");
 				ArchivePluginProject(
 					projectParams,
-					deploymentContexts
+					deploymentContexts,
+                    pd3Params
 				);
 
                 if (!string.IsNullOrWhiteSpace(pd3Params.ZipExportDirectory))
@@ -3075,7 +3222,7 @@ namespace CrimeFactory.Automation
 			if (plugins == null || plugins.Count == 0)
 			{
 				LogInformation(
-					"PASS 2: Shipping receipt has no plugin entries to sanitize."
+					"PASS 2: Shipping receipt has no top-level Plugins entries to sanitize; RuntimeDependencies will be validated in the deployment context before staging."
 				);
 
 				return null;
@@ -3235,10 +3382,11 @@ namespace CrimeFactory.Automation
 			string workingPluginDirectory = null;
 			string shippingReceipt = null;
 			string originalShippingReceipt = null;
+			CrimeFactoryPALPackagingManifest palManifest = null;
 
 			try
 			{
-				CrimeFactoryPALPackagingManifest palManifest =
+				palManifest =
 					LoadPALPackagingManifest(
 						cmd,
 						pluginName,
@@ -3391,6 +3539,9 @@ namespace CrimeFactory.Automation
 				result.SetPhase("PASS 2: Cook PAL chunk");
 				Project.Cook(chunkParams);
 
+				result.SetPhase("PASS 2: Verify cooker consumed package manifest");
+				EnsurePass2CookInputWasConsumed(palManifest);
+
 				result.SetPhase("PASS 2: Verify PAL chunk");
 
 				EnsureExpectedPackagesInChunkManifest(
@@ -3402,9 +3553,9 @@ namespace CrimeFactory.Automation
 
 				/*
 				 * Project.CreateDeploymentContext reads the Shipping receipt and
-				 * later staging uses its plugin list. Remove all <Project>/Mods
-				 * entries temporarily so deleted/renamed content-only mods cannot
-				 * break staging.
+				 * retains its RuntimeDependencies in StageTargets. Preserve the legacy
+				 * Plugins-array sanitization here; resolved runtime dependencies are
+				 * validated separately immediately before CreateStagingManifest.
 				 */
 				result.SetPhase("PASS 2: Sanitize Shipping receipt");
 
@@ -3422,7 +3573,8 @@ namespace CrimeFactory.Automation
 				result.SetPhase("PASS 2: Stage PAL chunk");
 				CopyBuildToStagingDirectory(
 					chunkParams,
-					chunkContexts
+					chunkContexts,
+					activeModDescriptor: dlcParams.DLCFile
 				);
 
 				result.SetPhase("PASS 2: Merge IoStore containers");
@@ -3457,7 +3609,8 @@ namespace CrimeFactory.Automation
 					dlcParams,
 					workingPluginDirectory,
 					pluginName,
-					finalCookPlatform
+					finalCookPlatform,
+                    pd3Params
 				);
 
                 if (!string.IsNullOrWhiteSpace(pd3Params.ZipExportDirectory))
@@ -3476,6 +3629,18 @@ namespace CrimeFactory.Automation
 			}
 			finally
 			{
+				if (palManifest != null &&
+				    !string.IsNullOrWhiteSpace(palManifest.Pass2CommandFile) &&
+				    File.Exists(palManifest.Pass2CommandFile))
+				{
+					// Avoid leaving stale preboot commands around on failure.
+					try { File.Delete(palManifest.Pass2CommandFile); }
+					catch (Exception exception)
+					{
+						LogWarning("Could not delete stale PASS 2 cook input: {0}",
+							exception.Message);
+					}
+				}
 				/*
 				 * Receipt sanitization is deliberately temporary. The real target
 				 * receipt is restored exactly as it was even if PASS 2 fails.
@@ -3542,6 +3707,9 @@ namespace CrimeFactory.Automation
 						ParseOptionalStringParam(
 							"LaunchGameType"),
                     ZipExportDirectory = ParseOptionalStringParam("ZipExportDir"),
+                    CreateUtilityArchive = ParseParam("CreateUtilityArchive"),
+                    ArchiveUtility = ParseOptionalStringParam("ArchiveUtility") ?? "WinRAR",
+                    ArchiveExecutable = ParseOptionalStringParam("ArchiveExecutable"),
 					CopyToGameDirectory =
 						ParseParam("CopyToGameDir")
 				};
