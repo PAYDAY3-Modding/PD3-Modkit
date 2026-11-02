@@ -211,13 +211,13 @@ void SCrimeFactoryModEntryList::RefreshFolderTree()
     FolderRoots.Add(All);
     FolderItems.Add(All->Id, All);
     auto Root = MakeShared<FCrimeFactoryFolderTreeItem>();
-    Root->Name = LOCTEXT("RootMods", "Root / Unassigned");
+    Root->Name = LOCTEXT("RootMods", "Root");
     FolderRoots.Add(Root);
     FolderItems.Add(FString(), Root);
-    TArray<TSharedPtr<FCrimeFactoryFolderTreeItem>> Pending { Root };
-    for (int32 Index = 0; Index < Pending.Num(); ++Index)
+    TArray<TSharedPtr<FCrimeFactoryFolderTreeItem>> PendingFolders { Root };
+    for (int32 Index = 0; Index < PendingFolders.Num(); ++Index)
     {
-        const auto Item = Pending[Index];
+        const auto Item = PendingFolders[Index];
         for (const auto& Folder : Organisation->Children(Item->Id))
         {
             auto Child = MakeShared<FCrimeFactoryFolderTreeItem>();
@@ -225,7 +225,7 @@ void SCrimeFactoryModEntryList::RefreshFolderTree()
             Child->Name = FText::FromString(Folder.Name);
             Item->Children.Add(Child);
             FolderItems.Add(Child->Id, Child);
-            Pending.Add(Child);
+            PendingFolders.Add(Child);
         }
     }
     FolderTree->RequestTreeRefresh();
