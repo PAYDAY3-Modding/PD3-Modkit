@@ -11,6 +11,7 @@ struct FDynamicClassGenerationContext
 {
     // Key is the path of the object
 	TSharedPtr<FJsonObject> GlobalObjectMap;
+    TSharedPtr<FJsonObject> MetadataOverrides;
     // Value is the class path of the class
     TMap<UClass*, FString> ClassesPendingConstruction;
     // Value is the object path of the class default object
@@ -59,6 +60,9 @@ class FSuziePluginModule : public IModuleInterface
 public:
     virtual void StartupModule() override;
     virtual void ShutdownModule() override;
+    // Dynamic classes and lifecycle callbacks retain native code pointers.
+    // Restart the editor to reload native implementations safely.
+    virtual bool SupportsDynamicReloading() override { return false; }
 
 private:
     TSharedPtr<FUICommandList> PluginCommands;

@@ -8,13 +8,16 @@ public class Suzie : ModuleRules
 
 		PublicIncludePaths.AddRange(new string[] {}); 
 		
-		PrivateIncludePaths.AddRange(new string[] {});
+		PrivateIncludePaths.Add(System.IO.Path.Combine(PluginDirectory, "Intermediate", "NativeBodies"));
+		ExternalDependencies.Add(System.IO.Path.Combine(PluginDirectory, "Tools", "GenerateNativeBodies.ps1"));
 
 
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
 				"Core",
+				"CoreUObject",
+				"Engine",
 				"GameplayTags",
 			}
 			);
@@ -22,13 +25,13 @@ public class Suzie : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"CoreUObject",
-				"Engine",
 				"Blutility",
 				"Json",
 				"UnrealEd",
 				"Projects",
 				"BlueprintGraph",
+				"UMG",
+				"SlateCore",
 				"zlib",
 			}
 			);
