@@ -54,6 +54,12 @@
 #include "Brushes/SlateDynamicImageBrush.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "InputCoreTypes.h"
+#include "Slate.h"
+#include "PropertyEditorModule.h"
+#include "IDetailsView.h"
 
 #define LOCTEXT_NAMESPACE "CrimeFactoryModListEntry"
 
@@ -2948,6 +2954,37 @@ namespace
 
 }
 
+
+FReply SCrimeFactoryModEntry::OnMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& Event)
+{
+    // Child buttons keep their normal clicks. The card background and title can be dragged.
+    if (Event.GetEffectingButton() == EKeys::LeftMouseButton)
+        return FReply::Handled().DetectDrag(SharedThis(this), EKeys::LeftMouseButton);
+    return SCompoundWidget::OnMouseButtonDown(Geometry, Event);
+}
+
+FReply SCrimeFactoryModEntry::OnDragDetected(const FGeometry&, const FPointerEvent&)
+{
+    if (auto Pinned = Owner.Pin(); Pinned && Mod.IsValid()) return Pinned->BeginModDrag(Mod.ToSharedRef());
+    return FReply::Unhandled();
+}
+
+FReply SCrimeFactoryModEntry::OnMouseButtonUp(const FGeometry& Geometry, const FPointerEvent& Event)
+{
+    if (Event.GetEffectingButton() != EKeys::RightMouseButton || !Mod.IsValid())
+        return SCompoundWidget::OnMouseButtonUp(Geometry, Event);
+    FMenuBuilder Menu(true, nullptr);
+    Menu.AddMenuEntry(LOCTEXT("ModContextContent", "Open in Content Browser"), FText::GetEmpty(), FSlateIcon(),
+        FUIAction(FExecuteAction::CreateLambda([Weak = TWeakPtr<SCrimeFactoryModEntry>(SharedThis(this))] { if (auto Entry = Weak.Pin()) Entry->OnOpenModContent(); })));
+    Menu.AddMenuEntry(LOCTEXT("ModContextInformation", "Information"), FText::GetEmpty(), FSlateIcon(),
+        FUIAction(FExecuteAction::CreateLambda([Weak = TWeakPtr<SCrimeFactoryModEntry>(SharedThis(this))] { if (auto Entry = Weak.Pin()) Entry->OnOpenInformation(); })));
+    Menu.AddMenuEntry(LOCTEXT("ModContextConfig", "Configure"), FText::GetEmpty(), FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SCrimeFactoryModEntry::OnEditMod)));
+    Menu.AddMenuEntry(LOCTEXT("ModContextForge", "Forge"), FText::GetEmpty(), FSlateIcon(),
+        FUIAction(FExecuteAction::CreateLambda([Weak = TWeakPtr<SCrimeFactoryModEntry>(SharedThis(this))] { if (auto Entry = Weak.Pin()) Entry->PackageMod({}); })));
+    if (auto Pinned = Owner.Pin()) Pinned->AddMoveToFolderMenu(Menu, Mod.ToSharedRef());
+    FSlateApplication::Get().PushMenu(SharedThis(this), FWidgetPath(), Menu.MakeWidget(), Event.GetScreenSpacePosition(), FPopupTransitionEffect::ContextMenu);
+    return FReply::Handled();
+}
 
 void SCrimeFactoryModEntry::Construct(
 	const FArguments& Args,

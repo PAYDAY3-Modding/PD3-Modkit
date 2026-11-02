@@ -6,6 +6,7 @@
 #include "ModBrowser/CrimeFactoryModEntryList.h"
 #include "Interfaces/IPluginManager.h"
 #include "Styling/SlateColor.h"
+#include "Widgets/Input/SCheckBox.h"
 
 struct FCrimeFactoryPreflightResult;
 struct FCrimeFactoryForgeBatch;
@@ -41,6 +42,10 @@ class SCrimeFactoryModEntry : public SCompoundWidget {
     void RefreshModIcon();
     FReply OnEditModFinished(class UModMetadataObject* Metadata);
     FReply OnDeleteMod();
+
+    virtual FReply OnMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& Event) override;
+    virtual FReply OnMouseButtonUp(const FGeometry& Geometry, const FPointerEvent& Event) override;
+    virtual FReply OnDragDetected(const FGeometry& Geometry, const FPointerEvent& Event) override;
 
     FORCEINLINE bool IsSelected() {
         return Checkbox && Checkbox->IsChecked();
