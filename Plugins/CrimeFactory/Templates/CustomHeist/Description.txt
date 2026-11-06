@@ -1,0 +1,1 @@
+Create a mod plugin containing the basic assets for a custom heist.

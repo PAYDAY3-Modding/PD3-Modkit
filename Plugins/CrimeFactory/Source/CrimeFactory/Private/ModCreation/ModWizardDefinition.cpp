@@ -1,9 +1,12 @@
 #include "ModCreation/ModWizardDefinition.h"
+#include "Metadata/CrimeFactoryModIcon.h"
+#include "Metadata/CrimeFactoryMetadataSync.h"
 
 #include "Editor/CrimeFactory.h"
 #include "Settings/CrimeFactorySettings.h"
 #include "Dom/JsonObject.h"
 #include "Misc/FileHelper.h"
+#include "HAL/FileManager.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -14,6 +17,7 @@
 #include "Misc/App.h"
 #include "Misc/PackageName.h"
 #include "Misc/ScopeExit.h"
+#include "Internationalization/Regex.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"   
 #include "UObject/SavePackage.h"
@@ -32,6 +36,9 @@
 #include "UObject/StrongObjectPtr.h"
 #include "Engine/World.h"
 #include "ObjectTools.h"
+#include "PluginUtils.h"
+#include "UObject/CoreRedirects.h"
+#include "UObject/PackageFileSummary.h"
 
 #define LOCTEXT_NAMESPACE "NewModWizard"
 
@@ -55,7 +62,7 @@ namespace
 			TArray<FString> Segments;
 			Data.PackageName.ToString().ParseIntoArray(Segments, TEXT("/"), true);
 			if (!Segments.ContainsByPredicate([](const FString& Segment)
-				{ return Segment.StartsWith(TEXT("PLACEHOLDER_")) && Segment.EndsWith(TEXT("MODNAME")); })) continue;
+				{ return (Segment.StartsWith(TEXT("PLACEHOLDER_")) && Segment.EndsWith(TEXT("MODNAME"))) || Segment.EndsWith(TEXT("_PLACEHOLDER_MODNAME")); })) continue;
 			UObjectRedirector* Redirector = Cast<UObjectRedirector>(Data.GetAsset());
 			UObject* Destination = Redirector ? Redirector->DestinationObject : nullptr;
 			if (!Destination || Destination->IsA<UObjectRedirector>() ||
@@ -1489,11 +1496,11 @@ namespace
 			Descriptor.Description;
 
 		TArray<FString> Authors;
-
-		if (!Descriptor.CreatedBy.IsEmpty())
-		{
+		const TSharedRef<FJsonObject> MetadataJson = MakeShared<FJsonObject>();
+		if (Descriptor.CachedJson) FJsonObject::Duplicate(Descriptor.CachedJson, MetadataJson);
+		Descriptor.UpdateJson(MetadataJson.Get());
+		if (!MetadataJson->TryGetStringArrayField(TEXT("ModAuthors"), Authors) && !Descriptor.CreatedBy.IsEmpty())
 			Authors.Add(Descriptor.CreatedBy);
-		}
 
 		FString PDMLVersion;
 
@@ -1816,6 +1823,7 @@ namespace
 	class FCrimeFactoryPluginTemplateDescription final : public FPluginTemplateDescription
 	{
 	public:
+		TArray<FString> RequiredPluginNames;
 		FCrimeFactoryPluginTemplateDescription(
 			const FText& InName,
 			const FText& InDescription,
@@ -1834,6 +1842,14 @@ namespace
 		virtual void CustomizeDescriptorBeforeCreation(FPluginDescriptor& Descriptor) override
 		{
 			FPluginTemplateDescription::CustomizeDescriptorBeforeCreation(Descriptor);
+			for (const FString& RequiredName : RequiredPluginNames)
+			{
+				FPluginReferenceDescriptor Reference(RequiredName, true);
+				const auto RequiredPlugin = IPluginManager::Get().FindPlugin(RequiredName);
+				if (RequiredPlugin && !RequiredPlugin->GetDescriptor().VersionName.IsEmpty())
+					Reference.AdditionalFieldsToWrite.Add(TEXT("SemVersion"), MakeShared<FJsonValueString>(TEXT("^") + RequiredPlugin->GetDescriptor().VersionName));
+				Descriptor.Plugins.Add(Reference);
+			}
 
 			const FString PDMLPluginName = TEXT("PDML");
 			FString PDMLSemVersion;
@@ -1903,13 +1919,191 @@ namespace
 
 FModWizardDefinition::FModWizardDefinition()
 {
-	PluginBaseDir = IPluginManager::Get().FindPlugin(TEXT("CrimeFactory"))->GetBaseDir();
+	const auto Plugin = IPluginManager::Get().FindPlugin(TEXT("CrimeFactory"));
+	if (Plugin) PluginBaseDir = Plugin->GetBaseDir();
+	RefreshTemplates();
+}
 
-	ModTemplateDefinitions = FModuleManager::GetModuleChecked<FCrimeFactoryModule>(TEXT("CrimeFactory")).GetModTemplates();
-	for (TSharedRef<FModTemplateDescription> Template : ModTemplateDefinitions)
+void FModWizardDefinition::RefreshTemplates()
+{
+	const FString Selected = GetSelectedTemplate() ? GetSelectedTemplate()->OnDiskPath : FString();
+	ClearTemplateSelection();
+	ModTemplateDefinitions.Reset();
+	TemplateDefinitions.Reset();
+	DiscoveryError = FText::GetEmpty();
+	TArray<FString> Folders;
+	if (PluginBaseDir.IsEmpty() || !IFileManager::Get().DirectoryExists(*GetTemplatesDirectory()))
 	{
-		TemplateDefinitions.Add(Template->TemplateDescription);
+		DiscoveryError = LOCTEXT("TemplatesUnavailable", "The Templates directory is unavailable. Check the CrimeFactory installation and folder permissions.");
+		return;
 	}
+	if (!IFileManager::Get().IterateDirectory(*GetTemplatesDirectory(), [&Folders](const TCHAR* Path, bool bDirectory)
+		{ if (bDirectory) Folders.Add(FString(Path)); return true; }))
+	{
+		DiscoveryError = LOCTEXT("TemplatesUnreadable", "Unable to read the Templates directory. Check folder permissions.");
+		return;
+	}
+	Folders.Sort();
+	TSet<FString> Seen;
+	for (const FString& Folder : Folders)
+	{
+		const FString Key = FPaths::GetCleanFilename(Folder).ToLower();
+		if (Seen.Contains(Key)) continue;
+		Seen.Add(Key);
+		if (auto Template = FModTemplateDescription::FromFolder(Folder))
+		{
+			ModTemplateDefinitions.Add(Template.ToSharedRef());
+			TemplateDefinitions.Add(Template->TemplateDescription);
+			if (Folder == Selected) CurrentTemplateDefinition = Template;
+		}
+	}
+}
+
+TSharedPtr<IPlugin> FModWizardDefinition::CreateModFromSelection(const FString& Name, const FString& Destination,
+	const FPluginDescriptor& Descriptor, bool bShowContent, FText& Error)
+{
+	bPostCreationSucceeded = false;
+	if (!HasValidTemplateSelection() || !FModTemplateDescription::FromFolder(GetSelectedTemplate()->OnDiskPath))
+	{
+		Error = LOCTEXT("InvalidSelection", "The selected template is no longer valid. Refresh and select a template.");
+		return nullptr;
+	}
+	if (!IconOverridePath.IsEmpty() && !CrimeFactoryModIcon::IsValidPNG(IconOverridePath))
+	{
+		Error = LOCTEXT("InvalidCustomIcon", "The chosen icon is no longer readable. Choose a valid PNG icon.");
+		return nullptr;
+	}
+	const FString SourceContent = GetSelectedTemplate()->OnDiskPath / TEXT("Content");
+	TArray<FString> Files;
+	IFileManager::Get().FindFilesRecursive(Files, *SourceContent, TEXT("*"), true, false);
+	TArray<FCoreRedirect> Redirects;
+	TMap<FSoftObjectPath, FSoftObjectPath> SoftPaths;
+	TSet<FString> PackageNames;
+	TArray<FString> AssetFiles;
+	for (const FString& File : Files)
+	{
+		const FString Extension = FPaths::GetExtension(File);
+		if (Extension != TEXT("uasset") && Extension != TEXT("umap")) continue;
+		TUniquePtr<FArchive> Archive(IFileManager::Get().CreateFileReader(*File));
+		if (!Archive) { Error = FText::FromString(TEXT("Cannot read template asset: ") + File); return nullptr; }
+		FPackageFileSummary Summary;
+		*Archive << Summary;
+		if (Archive->IsError() || Summary.NameCount <= 0 || Summary.NameOffset < 0 ||
+			Summary.NameOffset > Archive->TotalSize() || Summary.NameCount > Archive->TotalSize() / 4)
+		{
+			Error = FText::FromString(TEXT("Unsupported or invalid template package: ") + File);
+			return nullptr;
+		}
+		// Older templates leave Summary.PackageName empty. Use Unreal's
+		// versioned name-table serializer to find exact referenced package paths.
+		Archive->SetUEVer(Summary.GetFileVersionUE());
+		Archive->SetLicenseeUEVer(Summary.GetFileVersionLicenseeUE());
+		Archive->SetCustomVersions(Summary.GetCustomVersionContainer());
+		Archive->Seek(Summary.NameOffset);
+		for (int32 Index = 0; Index < Summary.NameCount && !Archive->IsError(); ++Index)
+		{
+			FNameEntrySerialized Entry(ENAME_LinkerConstructor);
+			*Archive << Entry;
+			const FString Value = Entry.GetPlainNameString();
+			if (FPackageName::IsValidLongPackageName(Value)) PackageNames.Add(Value);
+		}
+		if (Archive->IsError()) { Error = FText::FromString(TEXT("Cannot read template package names: ") + File); return nullptr; }
+		AssetFiles.Add(File);
+	}
+	TSet<FString> OriginalPackages;
+	for (FString File : AssetFiles)
+	{
+		FString Relative = File;
+		FPaths::MakePathRelativeTo(Relative, *(SourceContent + TEXT("/")));
+		Relative = FPaths::GetBaseFilename(Relative, false);
+		FString OriginalPackage;
+		for (const FString& Candidate : PackageNames)
+		{
+			const int32 RootEnd = Candidate.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromStart, 1);
+			if (RootEnd == INDEX_NONE || Candidate.Mid(RootEnd + 1) != Relative) continue;
+			if (!OriginalPackage.IsEmpty() && OriginalPackage != Candidate)
+			{
+				Error = FText::FromString(TEXT("Ambiguous authoring package paths for template asset: ") + File);
+				return nullptr;
+			}
+			OriginalPackage = Candidate;
+		}
+		if (OriginalPackage.IsEmpty()) OriginalPackage = TEXT("/") + FPaths::GetCleanFilename(GetSelectedTemplate()->OnDiskPath) + TEXT("/") + Relative;
+		FString TargetPackage = TEXT("/") + Name + TEXT("/") + Relative;
+		TargetPackage = TargetPackage.Replace(TEXT("PLUGIN_NAME"), *Name, ESearchCase::CaseSensitive);
+		if (OriginalPackages.Contains(OriginalPackage))
+		{
+			Error = FText::FromString(TEXT("Duplicate original package in template: ") + OriginalPackage);
+			return nullptr;
+		}
+		OriginalPackages.Add(OriginalPackage);
+		if (OriginalPackage != TargetPackage)
+			Redirects.Emplace(ECoreRedirectFlags::Type_Package, OriginalPackage, TargetPackage);
+		const FString AssetName = FPackageName::GetShortName(OriginalPackage);
+		const FString TargetName = FPackageName::GetShortName(TargetPackage);
+		const FString OldObject = OriginalPackage + TEXT(".") + AssetName;
+		const FString NewObject = TargetPackage + TEXT(".") + TargetName;
+		SoftPaths.Add(FSoftObjectPath(OldObject), FSoftObjectPath(NewObject));
+		SoftPaths.Add(FSoftObjectPath(OldObject + TEXT("_C")), FSoftObjectPath(NewObject + TEXT("_C")));
+		SoftPaths.Add(FSoftObjectPath(OriginalPackage + TEXT(".Default__") + AssetName + TEXT("_C")),
+			FSoftObjectPath(TargetPackage + TEXT(".Default__") + TargetName + TEXT("_C")));
+	}
+	const FString RedirectOwner = TEXT("CrimeFactory.Template.") + Name;
+	if (!Redirects.IsEmpty() && !FCoreRedirects::AddRedirectList(Redirects, RedirectOwner))
+	{
+		FCoreRedirects::RemoveRedirectList(Redirects, RedirectOwner);
+		Error = LOCTEXT("RedirectConflict", "Unable to register template package redirects. Check the Output Log.");
+		return nullptr;
+	}
+	ON_SCOPE_EXIT { if (!Redirects.IsEmpty()) FCoreRedirects::RemoveRedirectList(Redirects, RedirectOwner); };
+	FPluginUtils::FNewPluginParamsWithDescriptor Params;
+	Params.TemplateFolders = GetFoldersForSelection();
+	Params.Descriptor = Descriptor;
+	GetPluginIconPath(Params.PluginIconPath);
+	GetSelectedTemplate()->CustomizeDescriptorBeforeCreation(Params.Descriptor);
+	FPluginUtils::FLoadPluginParams Load;
+	Load.bEnablePluginInProject = true;
+	Load.bUpdateProjectPluginSearchPath = true;
+	Load.bSelectInContentBrowser = bShowContent;
+	Load.OutFailReason = &Error;
+	auto Plugin = FPluginUtils::CreateAndLoadNewPlugin(Name, Name, Destination, Params, Load);
+	if (Plugin)
+	{
+		if (!IconOverridePath.IsEmpty() && !CrimeFactoryModIcon::CopyToResources(IconOverridePath, Plugin->GetBaseDir(), Error)) return Plugin;
+		// PluginUtils removes its copy-time redirects before returning. Some
+		// coincide with ours, so restore them for loading and post-processing.
+		if (!Redirects.IsEmpty()) FCoreRedirects::AddRedirectList(Redirects, RedirectOwner);
+		auto& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		Registry.ScanPathsSynchronous({Plugin->GetMountedAssetPath()}, true);
+		TArray<FAssetData> Assets;
+		Registry.GetAssetsByPath(FName(*Plugin->GetMountedAssetPath()), Assets, true);
+		TArray<UPackage*> Packages;
+		TArray<UObject*> LoadedAssets;
+		for (const FAssetData& Data : Assets)
+		{
+			UObject* Asset = Data.GetAsset();
+			if (!Asset) { Error = FText::FromString(TEXT("Cannot load copied template asset: ") + Data.GetObjectPathString()); return Plugin; }
+			LoadedAssets.Add(Asset);
+			Packages.AddUnique(Asset->GetOutermost());
+		}
+		FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get().RenameReferencingSoftObjectPaths(Packages, SoftPaths);
+		if (!LoadedAssets.IsEmpty() && !UEditorAssetLibrary::SaveLoadedAssets(LoadedAssets, false))
+		{
+			Error = LOCTEXT("SaveTemplateReferences", "Unable to save copied template asset references. See the Output Log.");
+			return Plugin;
+		}
+	}
+	PluginCreated(Name, Plugin.IsValid());
+	if (Plugin && bPostCreationSucceeded && UEditorAssetLibrary::DoesAssetExist(TEXT("/") + Name + TEXT("/DA_") + Name))
+	{
+		FString SyncError;
+		if (!CrimeFactoryMetadataSync::Synchronize(*Plugin, true, SyncError))
+		{
+			bPostCreationSucceeded = false;
+			Error = FText::FromString(SyncError);
+		}
+	}
+	return Plugin;
 }
 
 const TArray<TSharedRef<FPluginTemplateDescription>>& FModWizardDefinition::GetTemplatesSource() const
@@ -1998,7 +2192,7 @@ ELoadingPhase::Type FModWizardDefinition::GetPluginLoadingPhase() const
 
 bool FModWizardDefinition::GetTemplateIconPath(TSharedRef<FPluginTemplateDescription> Template, FString& OutIconPath) const
 {
-	bool bRequiresDefaultIcon = false;
+
 
 	FString TemplateFolderName = GetFolderForTemplate(Template);
 
@@ -2006,10 +2200,10 @@ bool FModWizardDefinition::GetTemplateIconPath(TSharedRef<FPluginTemplateDescrip
 	if (!FPlatformFileManager::Get().GetPlatformFile().FileExists(*OutIconPath))
 	{
 		OutIconPath = PluginBaseDir / TEXT("Resources/CrimeFactory128.png");
-		bRequiresDefaultIcon = true;
+
 	}
 
-	return bRequiresDefaultIcon;
+	return FPaths::FileExists(OutIconPath);
 }
 
 TArray<FString> FModWizardDefinition::GetFoldersForSelection() const
@@ -2026,6 +2220,7 @@ TArray<FString> FModWizardDefinition::GetFoldersForSelection() const
 
 void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName) const
 {
+	bPostCreationSucceeded = false;
 	UE_LOG(
 		LogCrimeFactory,
 		Display,
@@ -2097,6 +2292,11 @@ void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName
 	const auto ResolvePlaceholderName =
 		[&PluginName](const FString& InName, FString& OutName) -> bool
 		{
+			if (InName.EndsWith(TEXT("_PLACEHOLDER_MODNAME")))
+			{
+				OutName = InName.LeftChop(19) + PluginName;
+				return true;
+			}
 			if (!InName.StartsWith(TEXT("PLACEHOLDER_")) ||
 				!InName.EndsWith(TEXT("MODNAME")))
 			{
@@ -2184,7 +2384,7 @@ void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName
 				TEXT("Could not load template asset '%s' for rename/move."),
 				*AssetData.GetObjectPathString()
 			);
-			continue;
+			return;
 		}
 
 		RenameDataList.Add(
@@ -2235,6 +2435,7 @@ void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName
 				TEXT("One or more template assets failed to rename in plugin '%s'."),
 				*PluginName
 			);
+			return;
 		}
 	}
 	else
@@ -2265,6 +2466,7 @@ void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName
 		PluginContentPath +
 		FString::Printf(TEXT("PAL_%s"), *PluginName);
 
+	if (!UEditorAssetLibrary::DoesAssetExist(PALName)) { bPostCreationSucceeded = true; return; }
 	UPrimaryAssetLabel* Label =
 		Cast<UPrimaryAssetLabel>(
 			UEditorAssetLibrary::LoadAsset(*PALName)
@@ -2289,15 +2491,17 @@ void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName
 
 	const FSoftObjectPath DataAssetPath(*DataAssetName);
 
-	/*
-	 * The generated PAL only needs its generated DA as an explicit asset.
-	 * Reset + Add avoids ALL direct TArray index access here, so an empty
-	 * ExplicitAssets array can never trigger an Array.h bounds assertion.
-	 */
-	Label->ExplicitAssets.Reset();
+	// The metadata reference is optional for community templates.
+	if (!UEditorAssetLibrary::DoesAssetExist(DataAssetName)) { bPostCreationSucceeded = true; return; }
+	// Keep community PAL entries. Replace only the conventional metadata
+	// placeholder, then ensure the generated metadata is included.
+	Label->ExplicitAssets.RemoveAll([](const TSoftObjectPtr<UObject>& Entry)
+	{
+		return Entry.ToSoftObjectPath().GetAssetName() == TEXT("PLACEHOLDER_DA_MODNAME");
+	});
 	
 	const TSoftObjectPtr DataAssetSoftPtr(DataAssetPath);
-	Label->ExplicitAssets.Add(DataAssetSoftPtr);
+	Label->ExplicitAssets.AddUnique(DataAssetSoftPtr);
 
 	// Load directly from the soft path rather than indexing ExplicitAssets.
 	UObject* LoadedAsset = DataAssetPath.TryLoad();
@@ -2332,6 +2536,7 @@ void FModWizardDefinition::RenameTemplateAssetsForMods(const FString& PluginName
 
 	if (AssetSubsystem && AssetSubsystem->SaveAsset(*PALName))
 	{
+		bPostCreationSucceeded = true;
 		UE_LOG(
 			LogTemp,
 			Log,
@@ -2358,6 +2563,7 @@ bool FModWizardDefinition::PopulateGeneratedModDataAssetForPlugin(const FString&
 
 void FModWizardDefinition::PluginCreated(const FString& PluginName, bool bWasSuccessful) const
 {
+	bPostCreationSucceeded = false;
 	if(!bWasSuccessful)
 	{
 		UE_LOG(LogCrimeFactory, Error, TEXT("Failed to create mod %s"), *PluginName);
@@ -2415,6 +2621,40 @@ void FModWizardDefinition::PluginCreated(const FString& PluginName, bool bWasSuc
 		return;
 	}
 
+	// Configuration is text, unlike asset packages. Only complete, explicitly
+	// delimited naming tokens are substituted; assets go through AssetTools below.
+	TArray<FString> ConfigFiles;
+	IFileManager::Get().FindFilesRecursive(ConfigFiles, *(Plugin->GetBaseDir() / TEXT("Config")), TEXT("*.ini"), true, false);
+	const FRegexPattern TokenPattern(TEXT("\\bPLACEHOLDER_(?:[A-Za-z0-9]+_)*MODNAME\\b"));
+	for (const FString& ConfigFile : ConfigFiles)
+	{
+		FString Text;
+		if (!FFileHelper::LoadFileToString(Text, *ConfigFile))
+		{
+			UE_LOG(LogCrimeFactory, Error, TEXT("Cannot read generated configuration %s"), *ConfigFile);
+			return;
+		}
+		FRegexMatcher Matcher(TokenPattern, Text);
+		FString Updated;
+		int32 Last = 0;
+		while (Matcher.FindNext())
+		{
+			const FString Token = Matcher.GetCaptureGroup(0);
+			Updated += Text.Mid(Last, Matcher.GetMatchBeginning() - Last);
+			Updated += Token.Mid(12, Token.Len() - 19) + PluginName;
+			Last = Matcher.GetMatchEnding();
+		}
+		if (Last > 0)
+		{
+			Updated += Text.Mid(Last);
+			if (!FFileHelper::SaveStringToFile(Updated, *ConfigFile, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+			{
+				UE_LOG(LogCrimeFactory, Error, TEXT("Cannot save generated configuration %s"), *ConfigFile);
+				return;
+			}
+		}
+	}
+
 	// Initialize required fields
 	FPluginDescriptor Descriptor = Plugin->GetDescriptor();
 	if (Descriptor.FriendlyName.IsEmpty()) {
@@ -2429,6 +2669,7 @@ void FModWizardDefinition::PluginCreated(const FString& PluginName, bool bWasSuc
 	
 	// Initialize extra dependencies
 	for (const TSharedPtr<FModTemplateDependency>& Dependency : CurrentTemplateDefinition->Dependencies) {
+		if (Descriptor.Plugins.ContainsByPredicate([&Dependency](const FPluginReferenceDescriptor& Reference) { return Reference.Name.Equals(Dependency->Name, ESearchCase::IgnoreCase); })) continue;
 		FPluginReferenceDescriptor DependencyDescriptor(Dependency->Name, true);
 		DependencyDescriptor.AdditionalFieldsToWrite.Add( TEXT("SemVersion"), MakeShared<FJsonValueString>( TEXT("^") + Dependency->Version ) );
 		if(Dependency->bOptional) {
@@ -2490,7 +2731,8 @@ void FModWizardDefinition::PluginCreated(const FString& PluginName, bool bWasSuc
 	 * the generated PDA_ModMeta instance, discover ModActor classes and
 	 * custom-heist Data Assets, and repair heist LevelPath references.
 	 */
-	PopulateGeneratedModDataAsset(PluginName);
+	if (bPostCreationSucceeded && UEditorAssetLibrary::DoesAssetExist(TEXT("/") + PluginName + TEXT("/DA_") + PluginName))
+		bPostCreationSucceeded = PopulateGeneratedModDataAsset(PluginName);
 }
 
 FString FModWizardDefinition::GetPluginFolderPath() const
@@ -2503,84 +2745,71 @@ FString FModWizardDefinition::GetFolderForTemplate(TSharedRef<FPluginTemplateDes
 	return InTemplate->OnDiskPath;
 }
 
-TSharedPtr<FModTemplateDependency> FModTemplateDependency::Load(const TSharedPtr<FJsonObject> JSON, FString& Error)
+TSharedPtr<FModTemplateDescription> FModTemplateDescription::FromFolder(const FString& Folder)
 {
-	FString DependencyName;
-	if(!JSON->TryGetStringField(TEXT("name"), DependencyName)) {
-		Error = TEXT("\"name\" not in dependency");
+	const FString Name = FPaths::GetCleanFilename(Folder);
+	// Reject linked trees before recursive copy or inventory scans. A community
+	// template must be self-contained and cannot redirect writes or traversal.
+	IPlatformFile& FileSystem = FPlatformFileManager::Get().GetPlatformFile();
+	if (FileSystem.IsSymlink(*Folder) == ESymlinkResult::Symlink) return nullptr;
+	bool bSupportedTree = true;
+	TArray<FString> Pending{Folder};
+	while (!Pending.IsEmpty() && bSupportedTree)
+	{
+		const FString Directory = Pending.Pop();
+		if (!FileSystem.IterateDirectory(*Directory, [&](const TCHAR* Path, bool bDirectory)
+		{
+			const FString Leaf = FPaths::GetCleanFilename(Path);
+			if (FileSystem.IsSymlink(Path) == ESymlinkResult::Symlink ||
+				Leaf == TEXT("__ExternalActors__") || Leaf == TEXT("__ExternalObjects__"))
+			{
+				bSupportedTree = false;
+				return false;
+			}
+			if (bDirectory) Pending.Add(Path);
+			return true;
+		})) bSupportedTree = false;
+	}
+	if (!bSupportedTree)
+	{
+		UE_LOG(LogCrimeFactory, Warning, TEXT("Ignoring unreadable or unsupported template tree (linked or external actor content): %s"), *Folder);
 		return nullptr;
 	}
-
-	FString DependencyVersion;
-	if(!JSON->TryGetStringField(TEXT("version"), DependencyVersion)) {
-		TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(DependencyName);
-		if(!Plugin.IsValid()) {
-			Error = TEXT("\"version\" not in dependency and plugin not installed");
-			return nullptr;
-		}
-		DependencyVersion = Plugin->GetDescriptor().VersionName;
-	}
-
-	bool bOptional = false;
-	JSON->TryGetBoolField(TEXT("optional"), bOptional);
-
-	bool bBasePlugin = false;
-	JSON->TryGetBoolField(TEXT("basePlugin"), bBasePlugin);
-
-	return MakeShareable(new FModTemplateDependency(DependencyName, DependencyVersion, bOptional, bBasePlugin));
-}
-
-TSharedPtr<FModTemplateDescription> FModTemplateDescription::Load(const TSharedPtr<FJsonObject> JSON, const FString TemplatesPath, FString& Error)
-{
-	FString TemplateName;
-	if(!JSON->TryGetStringField(TEXT("name"), TemplateName)) {
-		Error = TEXT("\"name\" not in template");
+	// Content-only templates are supported. Native source and descriptors cannot
+	// safely be treated as content templates by this wizard.
+	if (Name.StartsWith(TEXT(".")) || !FPaths::ValidatePath(Name) ||
+		IFileManager::Get().DirectoryExists(*(Folder / TEXT("Source")))) return nullptr;
+	TArray<FString> Descriptors;
+	IFileManager::Get().FindFiles(Descriptors, *(Folder / TEXT("*.uplugin")), true, false);
+	if (!Descriptors.IsEmpty()) return nullptr;
+	bool bHasStructure = false;
+	for (const TCHAR* Part : {TEXT("Content"), TEXT("Config"), TEXT("Resources")})
+		bHasStructure |= IFileManager::Get().DirectoryExists(*(Folder / Part));
+	if (!bHasStructure)
+	{
+		UE_LOG(LogCrimeFactory, Warning, TEXT("Ignoring template without Content, Config or Resources: %s"), *Folder);
 		return nullptr;
 	}
-
-	FString TemplateDescription;
-	if(!JSON->TryGetStringField(TEXT("description"), TemplateDescription)) {
-		Error = TEXT("\"description\" not in template");
-		return nullptr;
-	}
-
-	FString TemplateFolderName;
-	if(!JSON->TryGetStringField(TEXT("path"), TemplateFolderName)) {
-		Error = TEXT("\"path\" not in template");
-		return nullptr;
-	}
-
+	FString Description;
+	FFileHelper::LoadFileToString(Description, *(Folder / TEXT("Description.txt")));
+	Description = Description.TrimStartAndEnd();
+	if (Description.IsEmpty()) Description = TEXT("Create a mod from the ") + Name + TEXT(" template.");
 	TArray<TSharedPtr<FModTemplateDependency>> Dependencies;
-	const TArray<TSharedPtr<FJsonValue>>* DependenciesPtr;
-	if(JSON->TryGetArrayField(TEXT("dependencies"), DependenciesPtr)) {
-		int i = 0;
-		for(const TSharedPtr<FJsonValue>& Item : *DependenciesPtr) {
-			i++;
-			const TSharedPtr<FJsonObject>* DependencyObjPtr;
-			if(!Item->TryGetObject(DependencyObjPtr)) {
-				Error = FString::Printf(TEXT("dependency %d: not an object"), i);
-				return nullptr;
-			}
-
-			FString DependencyError;
-			TSharedPtr<FModTemplateDependency> Dependency = FModTemplateDependency::Load(*DependencyObjPtr, DependencyError);
-			if (!Dependency.IsValid()) {
-				Error = FString::Printf(TEXT("dependency %d: %s"), i, *DependencyError);
-				return nullptr;
-			}
-			
-			Dependencies.Add(Dependency);
-		}
+	TArray<FString> Names;
+	FFileHelper::LoadFileToStringArray(Names, *(Folder / TEXT("Dependencies.txt")));
+	for (FString DependencyName : Names)
+	{
+		DependencyName.TrimStartAndEndInline();
+		if (DependencyName.IsEmpty() || DependencyName.StartsWith(TEXT("#"))) continue;
+		const auto Plugin = IPluginManager::Get().FindPlugin(DependencyName);
+		Dependencies.Add(MakeShared<FModTemplateDependency>(DependencyName,
+			Plugin ? Plugin->GetDescriptor().VersionName : FString(), false, false));
 	}
-
-	TSharedRef<FPluginTemplateDescription> PluginTemplateDescription = MakeShareable(new FCrimeFactoryPluginTemplateDescription(
-			FText::FromString(TemplateName),
-			FText::FromString(TemplateDescription),
-			TemplatesPath / TemplateFolderName,
-			true,
-			EHostType::Runtime));
-	PluginTemplateDescription->bCanBePlacedInEngine = false;
-    return MakeShareable(new FModTemplateDescription(PluginTemplateDescription, Dependencies));
+	auto Template = MakeShared<FCrimeFactoryPluginTemplateDescription>(
+		FText::FromString(FName::NameToDisplayString(Name, false)), FText::FromString(Description), Folder, true, EHostType::Runtime);
+	for (const auto& Dependency : Dependencies) Template->RequiredPluginNames.AddUnique(Dependency->Name);
+	Template->bCanBePlacedInEngine = false;
+	return MakeShared<FModTemplateDescription>(Template, Dependencies);
 }
 
 #undef LOCTEXT_NAMESPACE

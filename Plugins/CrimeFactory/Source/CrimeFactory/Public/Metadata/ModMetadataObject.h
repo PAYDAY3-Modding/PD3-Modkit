@@ -66,6 +66,8 @@ public:
 
 	/** Path to this this mod's icon */
 	FString TargetIconPath;
+	/** Pending icon choice, copied only when the form is saved or the mod is created. */
+	FString ChosenIconPath;
 	FSimpleDelegate OnIconChanged;
 
 	/** The default Unreal Engine Version field. This is set automatically to match the first section of SemVersion */
