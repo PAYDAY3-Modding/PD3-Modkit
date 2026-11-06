@@ -54,7 +54,7 @@ public:
     UPROPERTY(EditAnywhere, Config, Category = "Pawn Spawn Visualisation", meta = (ClampMin = "0.01", UIMin = "0.01"))
     float PawnPreviewScale = 1.0f;
 
-    /** Choose a spawner class and request property. Previews use the first pawn/spawn definition and the default appearance category's first eligible variant, in reference pose. Runtime equipment and animation are not executed. */
+    /** Choose a spawner class and request property. Predefined spawners use Seed for a stable representative pawn/appearance and the initial spawn transform. Other spawners use the first authored entry. Previews remain in reference pose; mission spawn choices, runtime equipment and animation are not executed. */
     UPROPERTY(EditAnywhere, Config, Category = "Pawn Spawn Visualisation", meta = (TitleProperty = "ActorClass"))
     TArray<FCrimeFactoryPawnSpawnerDefinition> PawnSpawnerDefinitions;
 

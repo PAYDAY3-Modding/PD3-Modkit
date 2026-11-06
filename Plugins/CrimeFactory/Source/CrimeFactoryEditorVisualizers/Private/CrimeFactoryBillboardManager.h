@@ -52,6 +52,8 @@ private:
     TMap<TWeakObjectPtr<ULevel>, FLevelHooks> Levels;
     TSet<TWeakObjectPtr<AActor>> PendingActors;
     FTSTicker::FDelegateHandle TickHandle;
+    /** Prevent duplicate bindings and refresh work during/after teardown. */
+    bool bInitialized = false;
     bool bScanWorlds = false;
     bool bReloadDefinitions = false;
     bool bSuspendedForPIE = false;

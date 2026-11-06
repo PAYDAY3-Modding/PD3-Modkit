@@ -31,6 +31,8 @@ namespace
 
 void FCrimeFactoryBillboardManager::Initialize()
 {
+    if (bInitialized) { return; }
+    bInitialized = true;
     Bind(GetMutableDefault<UCrimeFactoryActorVisualisationSettings>()->OnSettingChanged(),
         [this](UObject*, FPropertyChangedEvent&) { RequestRefresh(true); });
 
@@ -164,6 +166,10 @@ void FCrimeFactoryBillboardManager::Initialize()
 
 void FCrimeFactoryBillboardManager::Shutdown()
 {
+    if (!bInitialized) { return; }
+    // Component destruction can emit editor events. Never schedule fresh work
+    // while removing delegates, levels and their transient visualizations.
+    bInitialized = false;
     FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
     TickHandle.Reset();
     for (auto& Unbind : Unbinders) { Unbind(); }
@@ -193,6 +199,10 @@ void FCrimeFactoryBillboardManager::Shutdown()
     Definitions.Empty();
     DefinitionClasses.Empty();
     PendingActors.Empty();
+    bScanWorlds = false;
+    bReloadDefinitions = false;
+    bSuspendedForPIE = false;
+    ActorExportDepth = 0;
 }
 
 bool FCrimeFactoryBillboardManager::IsEligible(const AActor* Actor)
@@ -204,6 +214,7 @@ bool FCrimeFactoryBillboardManager::IsEligible(const AActor* Actor)
 
 void FCrimeFactoryBillboardManager::RequestRefresh(bool bReload)
 {
+    if (!bInitialized) { return; }
     bScanWorlds = true;
     bReloadDefinitions |= bReload;
     if (!TickHandle.IsValid())
@@ -214,6 +225,7 @@ void FCrimeFactoryBillboardManager::RequestRefresh(bool bReload)
 
 void FCrimeFactoryBillboardManager::QueueActor(AActor* Actor)
 {
+    if (!bInitialized) { return; }
     if (IsEligible(Actor))
     {
         PendingActors.Add(Actor);
@@ -235,6 +247,7 @@ void FCrimeFactoryBillboardManager::TrackLevel(ULevel* Level)
 
 bool FCrimeFactoryBillboardManager::Tick(float)
 {
+    if (!bInitialized) { TickHandle.Reset(); return false; }
     if (GIsSavingPackage || IsGarbageCollecting()) { return true; }
     if (bSuspendedForPIE || ActorExportDepth > 0) { TickHandle.Reset(); return false; }
     TGuardValue<bool> UpdatingGuard(bUpdating, true);
