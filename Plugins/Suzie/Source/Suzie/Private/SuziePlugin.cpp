@@ -30,6 +30,7 @@
 #include "Components/PrimitiveComponent.h"
 #include "GameFramework/WorldSettings.h"
 #include "UObject/ObjectSaveContext.h"
+#include "UObject/PD3CookedPackage.h"
 #include "Misc/CoreDelegates.h"
 #include "Modules/ModuleManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -45,6 +46,8 @@
 #endif
 
 DEFINE_LOG_CATEGORY(LogSuzie);
+
+static void RegisterRetailReplacementSchemas(const FDynamicClassGenerationContext& Context);
 
 namespace
 {
@@ -900,6 +903,7 @@ void FSuziePluginModule::StartupModule()
 
 void FSuziePluginModule::ShutdownModule()
 {
+    UE::PD3CookedEditor::SetRetailPropertyResolver({});
     SuzieNative::Reset();
     SuzieNativeLifecycle::Reset();
     SuzieHeistAuthoring::UnregisterEditorHooks();
@@ -1034,6 +1038,8 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     FDynamicClassGenerationContext ClassGenerationContext;
     ClassGenerationContext.GlobalObjectMap = *Objects;
     ClassGenerationContext.MetadataOverrides = SuzieReflectionMetadata::LoadOverrides();
+
+    RegisterRetailReplacementSchemas(ClassGenerationContext);
 
     // Create classes, script structs and global delegate functions
     for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
@@ -1958,6 +1964,51 @@ static bool CollectExpectedJmapSerializationSchema(
     return true;
 }
 
+
+static void RegisterRetailReplacementSchemas(const FDynamicClassGenerationContext& Context)
+{
+    // Keep /Game schema metadata without constructing any retail UObjects. A
+    // loose Blueprint can add variables, shifting every inherited UPS index.
+    // The loader needs retail order when a cooked export uses that loose class.
+    TMap<FString, TArray<FSuzieJmapSchemaEntry>> Layouts;
+    for (const auto& Pair : Context.GlobalObjectMap->Values)
+    {
+        if (!Pair.Key.StartsWith(TEXT("/Game/"))
+            || Pair.Value->AsObject()->GetStringField(TEXT("type")) != TEXT("Class")) continue;
+        TArray<FSuzieJmapSchemaEntry> Entries;
+        TSet<FString> Visited;
+        if (CollectExpectedJmapSerializationSchema(Context, Pair.Key, Entries, Visited, true))
+            Layouts.Add(Pair.Key, MoveTemp(Entries));
+    }
+    UE::PD3CookedEditor::SetRetailPropertyResolver(
+        [Layouts = MoveTemp(Layouts)](const UStruct* Struct, TArray<FProperty*>& OutProperties)
+        {
+            const auto* Entries = Layouts.Find(Struct->GetPathName());
+            if (!Entries) return false;
+            for (const auto& Entry : *Entries)
+            {
+                FProperty* Match = nullptr;
+                for (FProperty* Property = Struct->PropertyLink; Property; Property = Property->PropertyLinkNext)
+                {
+                    if (Property->GetFName() == Entry.PropertyName
+                        && Property->GetOwnerStruct()->GetPathName() == Entry.OwnerPath)
+                    {
+                        Match = Property;
+                        break;
+                    }
+                }
+                // No unknown data is skipped: refuse a removed or retyped retail
+                // property before consuming any values from this export.
+                checkf(Match && !Match->IsEditorOnlyProperty()
+                    && Match->ArrayDim == GetJmapArrayDim(Entry.Descriptor)
+                    && AreJmapAndRuntimePropertySignaturesCompatible(Entry.Descriptor, Match),
+                    TEXT("PD3 cooked replacement schema is incompatible: %s retail property %s:%s. Restore this dependency or preserve its retail property types."),
+                    *Struct->GetPathName(), *Entry.OwnerPath, *Entry.PropertyName.ToString());
+                OutProperties.Add(Match);
+            }
+            return true;
+        });
+}
 
 static void CollectRuntimePropertyLinkSchema(
     UStruct* Struct,

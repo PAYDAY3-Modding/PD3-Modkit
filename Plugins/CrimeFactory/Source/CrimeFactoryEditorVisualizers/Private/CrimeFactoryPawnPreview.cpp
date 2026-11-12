@@ -12,6 +12,7 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/Pawn.h"
 #include "Materials/MaterialInterface.h"
+#include "Math/RandomStream.h"
 #include "UObject/ICookInfo.h"
 #include "UObject/UObjectHash.h"
 #include "UObject/UnrealType.h"
@@ -54,6 +55,19 @@ namespace
     {
         const auto* Field = FindFProperty<FBoolProperty>(Type, Name);
         return Field && Field->GetPropertyValue_InContainer(Data);
+    }
+
+    /** Read the pawn's authored category; interval arrays are fixed-size reflected fields. */
+    int32 VariationCategory(const UObject* Pawn)
+    {
+        if (!Pawn) { return INDEX_NONE; }
+        const FProperty* Property = FindFProperty<FProperty>(Pawn->GetClass(), TEXT("VariationCategory"));
+        const void* Value = Property ? Property->ContainerPtrToValuePtr<void>(Pawn) : nullptr;
+        const auto* Enum = CastField<FEnumProperty>(Property);
+        const auto* Number = Enum ? Enum->GetUnderlyingProperty() : CastField<FNumericProperty>(Property);
+        if (!Number || !Number->IsInteger()) { return INDEX_NONE; }
+        const int64 Category = Number->GetSignedIntPropertyValue(Value);
+        return Category >= 0 && Category <= MAX_int32 ? static_cast<int32>(Category) : INDEX_NONE;
     }
 
     template <typename T>
@@ -166,9 +180,9 @@ UObject* FCrimeFactoryPawnPreview::ReadRequest(AActor& Actor, FName Name, FStrin
     return Request;
 }
 
-TSharedRef<FCrimeFactoryPawnPreview::FAppearance> FCrimeFactoryPawnPreview::Resolve(UObject* Request)
+TSharedRef<FCrimeFactoryPawnPreview::FAppearance> FCrimeFactoryPawnPreview::Resolve(UObject* Request, TOptional<int32> Seed)
 {
-    const FObjectKey Key(Request);
+    const FSelectionKey Key{ FObjectKey(Request), Seed.Get(0), Seed.IsSet() };
     if (const auto* Found = Cache.Find(Key)) { return *Found; }
     auto Result = MakeShared<FAppearance>();
     Cache.Add(Key, Result);
@@ -187,8 +201,12 @@ TSharedRef<FCrimeFactoryPawnPreview::FAppearance> FCrimeFactoryPawnPreview::Reso
             FScriptArrayHelper Values(Array, Array->ContainerPtrToValuePtr<void>(Request));
             if (Values.Num())
             {
-                // Deterministic representative: first authored pawn variation. Never randomize on refresh.
-                const void* Data = Values.GetRawPtr(0);
+                // Editor policy: retail chooses a class through global rand()/mission
+                // tracking, not this spawner seed. A local first draw gives a stable
+                // representative without consuming or emulating that gameplay state.
+                FRandomStream Stream(Seed.Get(0));
+                const int32 Selected = Seed.IsSet() ? Stream.RandHelper(Values.Num()) : 0;
+                const void* Data = Values.GetRawPtr(Selected);
                 PawnClass = Cast<UClass>(ObjectField(Entry->Struct, Data, TEXT("PawnClass")));
                 const AActor* Default = PawnClass && PawnClass->IsChildOf(APawn::StaticClass()) ? PawnClass->GetDefaultObject<AActor>() : nullptr;
                 if (BoolField(Entry->Struct, Data, TEXT("bOverrideVariationData")))
@@ -202,7 +220,12 @@ TSharedRef<FCrimeFactoryPawnPreview::FAppearance> FCrimeFactoryPawnPreview::Reso
                 if (BoolField(Entry->Struct, Data, TEXT("bOverrideVariationDataIntervals")))
                 {
                     const auto* Field = FindFProperty<FStructProperty>(Entry->Struct, TEXT("VariationCategoryIndexIntervals"));
-                    if (Field) { Interval = Field->ContainerPtrToValuePtr<void>(Data); IntervalType = Field->Struct; }
+                    const int32 Category = VariationCategory(Default);
+                    if (Field && Category >= 0 && Category < Field->ArrayDim)
+                    {
+                        Interval = Field->ContainerPtrToValuePtr<void>(Data, Category);
+                        IntervalType = Field->Struct;
+                    }
                 }
             }
             else
@@ -212,7 +235,12 @@ TSharedRef<FCrimeFactoryPawnPreview::FAppearance> FCrimeFactoryPawnPreview::Reso
                 if (Legacy)
                 {
                     FScriptArrayHelper Classes(Legacy, Legacy->ContainerPtrToValuePtr<void>(Request));
-                    if (Classes.Num()) { PawnClass = Cast<UClass>(ObjectValue(Legacy->Inner, Classes.GetRawPtr(0))); }
+                    if (Classes.Num())
+                    {
+                        FRandomStream Stream(Seed.Get(0));
+                        const int32 Selected = Seed.IsSet() ? Stream.RandHelper(Classes.Num()) : 0;
+                        PawnClass = Cast<UClass>(ObjectValue(Legacy->Inner, Classes.GetRawPtr(Selected)));
+                    }
                     if (PawnClass && PawnClass->IsChildOf(APawn::StaticClass()))
                     {
                         Variation = ObjectField<UObject>(*PawnClass->GetDefaultObject<AActor>(), TEXT("VariationData"));
@@ -227,21 +255,23 @@ TSharedRef<FCrimeFactoryPawnPreview::FAppearance> FCrimeFactoryPawnPreview::Reso
     }
     if (!PawnClass || !PawnClass->IsChildOf(APawn::StaticClass()) || PawnClass->HasAnyClassFlags(CLASS_NewerVersionExists | CLASS_Deprecated))
     {
-        Result->Error = TEXT("The request has no available pawn class in its first authored variation.");
+        Result->Error = TEXT("The request has no available pawn class in the selected authored variation.");
         return Result;
     }
-    ReadPawn(PawnClass, Variation, Interval, IntervalType, *Result);
+    ReadPawn(PawnClass, Variation, Interval, IntervalType, Seed, *Result);
     return Result;
 }
 
 void FCrimeFactoryPawnPreview::ReadPawn(UClass* Class, UObject* Variation, const void* Interval,
-    UScriptStruct* IntervalType, FAppearance& Out)
+    UScriptStruct* IntervalType, TOptional<int32> Seed, FAppearance& Out)
 {
     AActor* Default = Class->GetDefaultObject<AActor>();
     Out.Keep(Class);
     Out.Keep(Default);
     Out.Keep(Variation);
     if (!Default) { Out.Error = TEXT("Pawn class defaults are unavailable."); return; }
+    const UClass* AI = FindObject<UClass>(nullptr, TEXT("/Script/Starbreeze.SBZAICharacter"));
+    if (!AI || !Class->IsChildOf(AI)) { Seed.Reset(); }
 
     // Read templates, including inherited Blueprint SCS overrides, without constructing a pawn
     // or running a construction script. Custom gameplay mesh-component subclasses are never cloned.
@@ -352,7 +382,15 @@ void FCrimeFactoryPawnPreview::ReadPawn(UClass* Class, UObject* Variation, const
             const auto* Materials = FindFProperty<FArrayProperty>(Variation->GetClass(), TEXT("OverrideMaterials"));
             if (Materials && FScriptArrayHelper(Materials, Materials->ContainerPtrToValuePtr<void>(Variation)).Num())
             {
-                ReadMaterials(*Variation, Part.Materials);
+                TArray<UMaterialInterface*> Overrides;
+                ReadMaterials(*Variation, Overrides);
+                for (int32 Index = 0; Index < Overrides.Num(); ++Index)
+                {
+                    // Null overrides retain the selected mesh/template material slot.
+                    if (!Overrides[Index]) { continue; }
+                    if (Part.Materials.Num() <= Index) { Part.Materials.SetNumZeroed(Index + 1); }
+                    Part.Materials[Index] = Overrides[Index];
+                }
             }
             const auto* Variations = FindFProperty<FArrayProperty>(Variation->GetClass(), TEXT("Variations"));
             const auto* ValueType = Variations ? CastField<FStructProperty>(Variations->Inner) : nullptr;
@@ -362,7 +400,12 @@ void FCrimeFactoryPawnPreview::ReadPawn(UClass* Class, UObject* Variation, const
                 if (!Interval)
                 {
                     const auto* DefaultInterval = FindFProperty<FStructProperty>(Class, TEXT("VariationCategoryIndexIntervals"));
-                    if (DefaultInterval) { Interval = DefaultInterval->ContainerPtrToValuePtr<void>(Default); IntervalType = DefaultInterval->Struct; }
+                    const int32 Category = VariationCategory(Default);
+                    if (DefaultInterval && Category >= 0 && Category < DefaultInterval->ArrayDim)
+                    {
+                        Interval = DefaultInterval->ContainerPtrToValuePtr<void>(Default, Category);
+                        IntervalType = DefaultInterval->Struct;
+                    }
                 }
                 int32 Representative = 0;
                 if (Interval && IntervalType)
@@ -373,12 +416,24 @@ void FCrimeFactoryPawnPreview::ReadPawn(UClass* Class, UObject* Variation, const
                     {
                         const int32 Lower = Min->GetPropertyValue_InContainer(Interval);
                         const int32 Upper = Max->GetPropertyValue_InContainer(Interval);
-                        if (Lower >= 0)
+                        if (Seed.IsSet() && Values.Num())
+                        {
+                            // Verified SBZAICharacter rule: signed remainder followed by
+                            // category clamping, including negative seeds and open bounds.
+                            const int32 First = Lower < 0 ? 0 : FMath::Clamp(Lower, 0, Values.Num() - 1);
+                            const int32 Last = Upper < 0 ? Values.Num() - 1 : FMath::Clamp(Upper, 0, Values.Num() - 1);
+                            Representative = FMath::Max(First, FMath::Min(Seed.GetValue() % Values.Num(), Last));
+                        }
+                        else if (Lower >= 0)
                         {
                             if (Lower > Upper || !Values.IsValidIndex(Lower)) { Out.Error = TEXT("Appearance variation interval is out of range."); return; }
                             Representative = Lower;
                         }
                     }
+                }
+                else if (Seed.IsSet() && Values.Num())
+                {
+                    Representative = FMath::Max(0, Seed.GetValue() % Values.Num());
                 }
                 if (Values.Num())
                 {
@@ -389,7 +444,9 @@ void FCrimeFactoryPawnPreview::ReadPawn(UClass* Class, UObject* Variation, const
                         Part.PrimitiveData.Reset(Data->ArrayDim);
                         for (int32 Index = 0; Index < Data->ArrayDim; ++Index)
                         {
-                            Part.PrimitiveData.Add(Data->GetPropertyValue(Data->ContainerPtrToValuePtr<void>(Value, Index)));
+                            const float Float = Data->GetPropertyValue(Data->ContainerPtrToValuePtr<void>(Value, Index));
+                            if (!FMath::IsFinite(Float)) { Out.Error = TEXT("Appearance variation contains non-finite primitive data."); return; }
+                            Part.PrimitiveData.Add(Float);
                         }
                     }
                     const auto* Morphs = FindFProperty<FMapProperty>(ValueType->Struct, TEXT("MorphTargets"));
@@ -400,7 +457,10 @@ void FCrimeFactoryPawnPreview::ReadPawn(UClass* Class, UObject* Variation, const
                         FScriptMapHelper Map(Morphs, Morphs->ContainerPtrToValuePtr<void>(Value));
                         for (int32 Index = 0; Index < Map.GetMaxIndex(); ++Index)
                         {
-                            if (Map.IsValidIndex(Index)) { Part.MorphTargets.Add(Name->GetPropertyValue(Map.GetKeyPtr(Index)), Weight->GetPropertyValue(Map.GetValuePtr(Index))); }
+                            if (!Map.IsValidIndex(Index)) { continue; }
+                            const float Float = Weight->GetPropertyValue(Map.GetValuePtr(Index));
+                            if (!FMath::IsFinite(Float)) { Out.Error = TEXT("Appearance variation contains a non-finite morph weight."); return; }
+                            Part.MorphTargets.Add(Name->GetPropertyValue(Map.GetKeyPtr(Index)), Float);
                         }
                     }
                 }
@@ -443,7 +503,16 @@ TOptional<FTransform> FCrimeFactoryPawnPreview::GetSpawnTransform(const AActor& 
         FScriptArrayHelper Values(Array, Array->ContainerPtrToValuePtr<void>(&Actor));
         if (Values.Num() && Transform && Transform->Struct == TBaseStructure<FTransform>::Get())
         {
-            Spawn = *Transform->ContainerPtrToValuePtr<FTransform>(Values.GetRawPtr(0));
+            int32 Selected = 0;
+            const auto* Seed = FindFProperty<FIntProperty>(Actor.GetClass(), TEXT("Seed"));
+            if (Seed && BoolField(Actor.GetClass(), &Actor, TEXT("bRandomizeSpawnTransformStartingIndex")))
+            {
+                // Retail's first local stream draw chooses the initial transform.
+                // No mission state exists in this editor preview; keep Seed authored.
+                FRandomStream Stream(Seed->GetPropertyValue_InContainer(&Actor));
+                Selected = Stream.RandHelper(Values.Num());
+            }
+            Spawn = *Transform->ContainerPtrToValuePtr<FTransform>(Values.GetRawPtr(Selected));
         }
         const auto* Handling = FindFProperty<FStructProperty>(Actor.GetClass(), TEXT("RotationHandling"));
         if (Handling)
@@ -484,7 +553,11 @@ void FCrimeFactoryPawnPreview::UpdateActor(AActor& Actor)
     FString Description;
     UObject* Request = ReadRequest(Actor, Property, Description);
     if (!IsValid(Request)) { RemoveActor(Actor); Warn(Actor, Description); return; }
-    TSharedRef<FAppearance> Appearance = Resolve(Request);
+    TOptional<int32> Seed;
+    const UClass* Predefined = FindObject<UClass>(nullptr, TEXT("/Script/Starbreeze.SBZPawnSpawnPredefined"));
+    const auto* SeedProperty = FindFProperty<FIntProperty>(Actor.GetClass(), TEXT("Seed"));
+    if (Predefined && Actor.IsA(Predefined) && SeedProperty) { Seed = SeedProperty->GetPropertyValue_InContainer(&Actor); }
+    TSharedRef<FAppearance> Appearance = Resolve(Request, Seed);
     const TOptional<FTransform> Spawn = GetSpawnTransform(Actor);
     if (!Appearance->Error.IsEmpty() || !Spawn.IsSet())
     {
@@ -506,7 +579,8 @@ void FCrimeFactoryPawnPreview::UpdateActor(AActor& Actor)
     {
         const FPart& Part = Appearance->Parts[Index];
         UMeshComponent* Component = Preview.Components[Index].Get();
-        if (Component && ((Part.SkeletalMesh != nullptr) != Component->IsA<USkeletalMeshComponent>()))
+        if (Component && (((Part.SkeletalMesh != nullptr) != Component->IsA<USkeletalMeshComponent>()) ||
+            Component->GetDefaultCustomPrimitiveData().Data.Num() > Part.PrimitiveData.Num()))
         {
             CrimeFactoryVisualisation::Destroy(*Component); Component = nullptr;
         }
@@ -538,11 +612,20 @@ void FCrimeFactoryPawnPreview::UpdateActor(AActor& Actor)
             {
                 Skeletal->SetSkeletalMesh(Part.SkeletalMesh);
                 Skeletal->ClearMorphTargets();
-                for (const auto& Morph : Part.MorphTargets) { Skeletal->SetMorphTarget(Morph.Key, Morph.Value); }
+                for (const auto& Morph : Part.MorphTargets)
+                {
+                    if (Part.SkeletalMesh && Part.SkeletalMesh->FindMorphTarget(Morph.Key)) { Skeletal->SetMorphTarget(Morph.Key, Morph.Value); }
+                }
             }
             else { CastChecked<UStaticMeshComponent>(Component)->SetStaticMesh(Part.StaticMesh); }
             Component->EmptyOverrideMaterials();
             for (int32 Material = 0; Material < Part.Materials.Num(); ++Material) { Component->SetMaterial(Material, Part.Materials[Material]); }
+            // Defaults survive render-state resets/re-registration. Use public
+            // setters, then replace runtime data exactly; never pad the payload.
+            for (int32 DataIndex = 0; DataIndex < Part.PrimitiveData.Num(); ++DataIndex)
+            {
+                Component->SetDefaultCustomPrimitiveDataFloat(DataIndex, Part.PrimitiveData[DataIndex]);
+            }
             Component->SetCustomPrimitiveData(Part.PrimitiveData);
             Component->SetVisibility(Part.bVisible);
         }
@@ -638,6 +721,7 @@ void FCrimeFactoryPawnPreview::RemoveAll()
     GetActors(Actors);
     for (const auto& Actor : Actors) { if (Actor.IsValid()) { RemoveActor(*Actor); } }
     Previews.Empty();
+    Cache.Empty();
 }
 
 void FCrimeFactoryPawnPreview::GetActors(TArray<TWeakObjectPtr<AActor>>& Out) const
@@ -666,5 +750,11 @@ void FCrimeFactoryPawnPreview::Prune()
     for (auto It = Warnings.CreateIterator(); It; ++It)
     {
         if (!It.Key().IsValid()) { It.RemoveCurrent(); }
+    }
+    // A dragged seed slider must not retain every appearance and its assets.
+    // Active previews keep their entries shared; retire unreferenced selections.
+    for (auto It = Cache.CreateIterator(); It; ++It)
+    {
+        if (It.Value().GetSharedReferenceCount() == 1) { It.RemoveCurrent(); }
     }
 }

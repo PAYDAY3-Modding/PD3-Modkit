@@ -55,16 +55,34 @@ private:
         TArray<TWeakObjectPtr<UMeshComponent>> Components;
     };
 
-    TSharedRef<FAppearance> Resolve(UObject* Request);
+    /** Saved spawner seeds participate in appearance caching; shared request assets do not own a selection. */
+    struct FSelectionKey
+    {
+        FObjectKey Request;
+        int32 Seed;
+        bool bSeeded;
+
+        bool operator==(const FSelectionKey& Other) const
+        {
+            return Request == Other.Request && Seed == Other.Seed && bSeeded == Other.bSeeded;
+        }
+
+        friend uint32 GetTypeHash(const FSelectionKey& Key)
+        {
+            return HashCombine(GetTypeHash(Key.Request), HashCombine(GetTypeHash(Key.Seed), GetTypeHash(Key.bSeeded)));
+        }
+    };
+
+    TSharedRef<FAppearance> Resolve(UObject* Request, TOptional<int32> Seed);
     void ReadPawn(UClass* Class, UObject* Variation, const void* VariationInterval,
-        class UScriptStruct* IntervalType, FAppearance& Out);
+        class UScriptStruct* IntervalType, TOptional<int32> Seed, FAppearance& Out);
     static UObject* ReadRequest(AActor& Actor, FName PropertyName, FString& Description);
     static TOptional<FTransform> GetSpawnTransform(const AActor& Actor);
     void Warn(AActor& Actor, const FString& Message);
 
     TMap<TWeakObjectPtr<UClass>, FName> Definitions;
     TArray<TStrongObjectPtr<UClass>> DefinitionClasses;
-    TMap<FObjectKey, TSharedRef<FAppearance>> Cache;
+    TMap<FSelectionKey, TSharedRef<FAppearance>> Cache;
     TMap<TWeakObjectPtr<AActor>, FActorPreview> Previews;
     TMap<TWeakObjectPtr<AActor>, FString> Warnings;
     bool bEnabled = true;

@@ -12,6 +12,8 @@
 #include "ISourceControlProvider.h"
 #include "ISourceControlOperation.h"
 #include "Metadata/ModMetadataObject.h"
+#include "Widgets/SCrimeFactoryModDetails.h"
+#include "Widgets/Layout/SExpandableArea.h"
 #include "SourceControlOperations.h"
 #include "Async/Async.h"
 #include "IUATHelperModule.h"
@@ -3569,69 +3571,80 @@ void SCrimeFactoryModEntry::OnEditMod()
 
 	// Create a property view
 	FPropertyEditorModule& EditModule = FModuleManager::Get().GetModuleChecked<FPropertyEditorModule>("PropertyEditor");
-	EditModule.RegisterCustomClassLayout(UModMetadataObject::StaticClass()->GetFName(), FOnGetDetailCustomizationInstance::CreateStatic(&FModMetadataCustomization::MakeInstance));
 	FDetailsViewArgs DetailsViewArgs;
 	DetailsViewArgs.bUpdatesFromSelection = false;
 	DetailsViewArgs.bLockable = false;
 	DetailsViewArgs.bAllowSearch = false;
-	DetailsViewArgs.NameAreaSettings = FDetailsViewArgs::ActorsUseNameArea;
+	DetailsViewArgs.NameAreaSettings = FDetailsViewArgs::HideNameArea;
+    DetailsViewArgs.bShowOptions = false;
+    DetailsViewArgs.bShowObjectLabel = false;
 	DetailsViewArgs.bHideSelectionTip = true;
 
 	TSharedRef<IDetailsView> PropertyView =
 		EditModule.CreateDetailView(DetailsViewArgs);
-	PropertyView->SetObject(MetadataObject, true);
+    PropertyView->SetIsPropertyVisibleDelegate(FIsPropertyVisible::CreateLambda([](const FPropertyAndParent& Property)
+    {
+        const FName Name = Property.Property.GetFName();
+        return Name != GET_MEMBER_NAME_CHECKED(UModMetadataObject, FriendlyName)
+            && Name != GET_MEMBER_NAME_CHECKED(UModMetadataObject, Description)
+            && Name != GET_MEMBER_NAME_CHECKED(UModMetadataObject, CreatedBy)
+            && Name != GET_MEMBER_NAME_CHECKED(UModMetadataObject, ModAuthors)
+            && Name != GET_MEMBER_NAME_CHECKED(UModMetadataObject, ModPageURL)
+            && Name != GET_MEMBER_NAME_CHECKED(UModMetadataObject, CreatedByURL)
+            && Name != GET_MEMBER_NAME_CHECKED(UModMetadataObject, Category);
+    }));
+    PropertyView->SetObject(MetadataObject, true);
 
-	// Create the window
-	PropertiesWindow = SNew(SWindow)
-		.ClientSize(FVector2D(800.0f, 700.0f))
-		.Title(LOCTEXT("ModMetadata", "Mod Properties"))
-		.Content()
-		[
-			SNew(SBorder)
-			.Padding(FMargin(8.0f, 8.0f))
-			[
-				SNew(SVerticalBox)
-
-				+SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(FMargin(5.0f, 10.0f, 5.0f, 5.0f))
-				[
-					SNew(STextBlock)
-					.Text(FText::FromString(Mod->GetName()))
-				]
-
-				+ SVerticalBox::Slot()
-				.Padding(5)
-				[
-					PropertyView
-				]
-
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(5)
-				.HAlign(HAlign_Right)
-				[
-					SNew(SButton)
-					.ContentPadding(FMargin(20.0f, 2.0f))
-					.Text(LOCTEXT("OkButtonLabel", "Ok"))
-					.OnClicked(this, &SCrimeFactoryModEntry::OnEditModFinished, MetadataObject)
-				]
-			]
-		];
+    PropertiesWindow = SNew(SWindow)
+        .ClientSize(FVector2D(960, 980)).MinWidth(560).MinHeight(480)
+        .SupportsMaximize(true).SupportsMinimize(false)
+        .Title(LOCTEXT("ModMetadata", "Mod Properties"))
+        [SNew(SBorder).BorderImage(FAppStyle::GetBrush("WhiteBrush")).BorderBackgroundColor(FStyleColors::Panel).Padding(24)
+         [SNew(SVerticalBox)
+          + SVerticalBox::Slot().AutoHeight()
+            [SNew(STextBlock).Text(LOCTEXT("PropertiesHeading", "Mod Properties")).Font(FAppStyle::GetFontStyle("HeadingSmall"))]
+          + SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 16)
+            [SNew(STextBlock).Text(FText::FromString(Mod->GetName())).ColorAndOpacity(FSlateColor::UseSubduedForeground())]
+          + SVerticalBox::Slot().FillHeight(1)
+            [SNew(SBorder).BorderImage(FAppStyle::GetBrush("WhiteBrush")).BorderBackgroundColor(FStyleColors::Recessed).Padding(16)
+             [SNew(SScrollBox) + SScrollBox::Slot()
+              [SNew(SVerticalBox)
+               + SVerticalBox::Slot().AutoHeight()
+                 [SNew(SCrimeFactoryModDetails).Metadata(MetadataObject).Identifier(FText::FromString(Mod->GetName()))
+                  .DefaultIcon_Lambda([this] { return ModIconBrush ? ModIconBrush.Get() : FAppStyle::GetBrush("Icons.Plugin"); })]
+               + SVerticalBox::Slot().AutoHeight().Padding(0, 16)
+                 [SNew(SExpandableArea).InitiallyCollapsed(true)
+                  .HeaderContent()[SNew(STextBlock).Text(LOCTEXT("AdvancedProperties", "Advanced Properties")).Font(FAppStyle::GetFontStyle("BoldFont"))]
+                  .BodyContent()[SNew(SBox).MinDesiredHeight(360)[PropertyView]]]]]]
+          + SVerticalBox::Slot().AutoHeight().Padding(0, 16)[SNew(SSeparator)]
+          + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right)
+            [SNew(SHorizontalBox)
+             + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+               [SNew(SButton).ButtonStyle(FAppStyle::Get(), "PrimaryButton").Text(LOCTEXT("SaveProperties", "Save Changes"))
+                .OnClicked(this, &SCrimeFactoryModEntry::OnEditModFinished, MetadataObject)]
+             + SHorizontalBox::Slot().AutoWidth()
+               [SNew(SButton).Text(LOCTEXT("CancelProperties", "Cancel"))
+                .OnClicked_Lambda([this] { PropertiesWindow->RequestDestroyWindow(); return FReply::Handled(); })]]]];
 
 	FSlateApplication::Get().AddModalWindow(PropertiesWindow.ToSharedRef(), Owner.Pin());
 }
 
 FReply SCrimeFactoryModEntry::OnEditModFinished(UModMetadataObject* MetadataObject)
 {
+    if (!MetadataObject->ChosenIconPath.IsEmpty())
+    {
+        FText IconError;
+        if (!CrimeFactoryModIcon::CopyToResources(MetadataObject->ChosenIconPath, Mod->GetBaseDir(), IconError))
+        {
+            FMessageDialog::Open(EAppMsgType::Ok, IconError);
+            return FReply::Handled();
+        }
+    }
 	FPluginDescriptor OldDescriptor = Mod->GetDescriptor();
 
 	// Update the descriptor with the new metadata
 	FPluginDescriptor NewDescriptor = OldDescriptor;
 	MetadataObject->CopyIntoDescriptor(NewDescriptor);
-
-	// Close the properties window
-	PropertiesWindow->RequestDestroyWindow();
 
 	// Write both to strings
 	FString OldText;
@@ -3659,12 +3672,17 @@ FReply SCrimeFactoryModEntry::OnEditModFinished(UModMetadataObject* MetadataObje
 		if(!Mod->UpdateDescriptor(NewDescriptor, FailReason))
 		{
 			FMessageDialog::Open(EAppMsgType::Ok, FailReason);
+            return FReply::Handled();
 		}
 	}
     RefreshModIcon();
     FString SyncError;
     if (!CrimeFactoryMetadataSync::Synchronize(*Mod, true, SyncError))
+    {
         FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(SyncError));
+        return FReply::Handled();
+    }
+    PropertiesWindow->RequestDestroyWindow();
 	return FReply::Handled();
 }
 

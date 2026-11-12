@@ -211,7 +211,7 @@ void SCrimeFactoryModEntryList::RefreshFolderTree()
     FolderRoots.Add(All);
     FolderItems.Add(All->Id, All);
     auto Root = MakeShared<FCrimeFactoryFolderTreeItem>();
-    Root->Name = LOCTEXT("RootMods", "Root");
+    Root->Name = LOCTEXT("RootMods", "Root / Unassigned");
     FolderRoots.Add(Root);
     FolderItems.Add(FString(), Root);
     TArray<TSharedPtr<FCrimeFactoryFolderTreeItem>> PendingFolders { Root };

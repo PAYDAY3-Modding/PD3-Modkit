@@ -11,6 +11,7 @@
 #include "Slate.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+#include "Misc/MessageDialog.h"
 #include "Async/Async.h"
 #include "Widgets/Layout/SWrapBox.h"
 #include "ModBrowser/CrimeFactoryModOrganisation.h"
@@ -541,7 +542,33 @@ FReply SCrimeFactoryModEntryList::ImportLegacyMod()
 
 FReply SCrimeFactoryModEntryList::CreateMod()
 {
-    FGlobalTabmanager::Get()->TryInvokeTab(FCrimeFactoryModule::ModCreatorTabName);
+    // Capture the stable folder ID when opening the form, not the current
+    // folder when creation eventually completes. Renaming preserves that ID.
+    const FString Folder = Organisation->CurrentFolder == FCrimeFactoryModOrganisation::AllMods
+        ? FString() : Organisation->CurrentFolder;
+    const auto Model = Organisation;
+    const TWeakPtr<SCrimeFactoryModEntryList> WeakBrowser = SharedThis(this);
+    FModuleManager::GetModuleChecked<FCrimeFactoryModule>(TEXT("CrimeFactory")).OpenModCreator(
+        [WeakBrowser, Model, Folder](IPlugin& Plugin)
+        {
+            const auto Browser = WeakBrowser.Pin();
+            FText Error;
+            if (Browser) Browser->LoadMods();
+            else if (!Model->Load(Error))
+            {
+                FMessageDialog::Open(EAppMsgType::Ok, Error);
+                return;
+            }
+            // The creation tab may outlive its browser. Preserve the assignment
+            // on disk even in that case, and recover safely if its folder was deleted.
+            const bool bFolderRemoved = !Model->HasFolder(Folder);
+            const FString Destination = bFolderRemoved ? FString() : Folder;
+            if (Model->AssignMods({FCrimeFactoryModOrganisation::ModKey(Plugin)}, Destination) && !Model->Save(Error))
+                FMessageDialog::Open(EAppMsgType::Ok, Error);
+            if (Browser) Browser->RefreshFolderContents();
+            if (bFolderRemoved)
+                FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("CreationFolderRemoved", "The original browser folder was removed. Your new mod is in Root / Unassigned."));
+        });
     return FReply::Handled();
 }
 
