@@ -4169,7 +4169,6 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         {TEXT("CPF_ExportObject"), CPF_ExportObject},
         {TEXT("CPF_BlueprintReadOnly"), CPF_BlueprintReadOnly},
         {TEXT("CPF_Net"), CPF_Net},
-        {TEXT("CPF_EditFixedSize"), CPF_EditFixedSize},
         {TEXT("CPF_Parm"), CPF_Parm},
         {TEXT("CPF_ZeroConstructor"), CPF_ZeroConstructor},
         {TEXT("CPF_OutParm"), CPF_OutParm},
@@ -4262,6 +4261,12 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     {
         PropertyFlags |= static_cast<EPropertyFlags>(0x0100000000000000ull);
     }
+
+    // The jmap tags many container properties with CPF_EditFixedSize. We deliberately ignore it
+    // so that arrays/sets/maps stay resizable in the editor. It is left out of the lookup table
+    // above, and it is also masked here so that it cannot sneak back in through a numeric (0x...)
+    // flag from the jmap or through ExtraPropertyFlags.
+    PropertyFlags &= ~CPF_EditFixedSize;
 
     const FString PropertyName = PropertyJson->GetStringField(TEXT("name"));
     const FString PropertyType = PropertyJson->GetStringField(TEXT("type"));
