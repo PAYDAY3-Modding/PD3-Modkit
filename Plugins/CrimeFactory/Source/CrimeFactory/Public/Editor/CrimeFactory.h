@@ -11,7 +11,6 @@ public:
     virtual void StartupModule() override;
     virtual void ShutdownModule() override;
 
-    TArray<TSharedRef<struct FModTemplateDescription>> GetModTemplates() const { return ModTemplates; }
 
     /**
      * Ensure this mod is present in the PrimaryAssetLabel scan configuration
@@ -28,13 +27,17 @@ public:
         const FString& PluginName,
         const FString& PluginMountPath);
     
+    /** Open or reuse the creation tab with the invoking browser's destination. */
+    void OpenModCreator(TFunction<void(IPlugin&)> OnCreated);
+
     /** ID name for the mod creator tab */
     static const FName ModCreatorTabName;
 private:
     FDelegateHandle CookedEditorSettingsChangedHandle;
-    FDelegateHandle PluginMountedHandle, PluginContentMountedHandle;
+    FDelegateHandle PluginContentMountedHandle;
     TSharedPtr<class FUICommandList> PluginCommands;
     TSharedPtr<class FExtender> ToolbarExtender;
+    TWeakPtr<class SCrimeFactoryCreateMod> ModCreatorWidget;
 
     TSharedRef<SDockTab> HandleSpawnModCreatorTab(const FSpawnTabArgs& SpawnTabArgs);
     
@@ -42,9 +45,7 @@ private:
     void UnregisterSettings() const;
 
     void RegisterModTemplates();
-    void AddModTemplatesFromPlugin(IPlugin& Plugin);
     bool RegisterPrimaryAssetLabelsFromPlugin(IPlugin& Plugin);
     bool PruneDeletedModRegistrations();
     void SaveAndRefreshAssetManagerSettings();
-    TArray<TSharedRef<struct FModTemplateDescription>> ModTemplates;
 };

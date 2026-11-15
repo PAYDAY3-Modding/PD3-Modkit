@@ -57,8 +57,7 @@ void UModMetadataObject::PopulateFromDescriptor(const FPluginDescriptor& InDescr
 	CachedJson->TryGetStringField( TEXT("SemVersion"), SemVersion );
 	CachedJson->TryGetStringField( TEXT("RemoteVersionRange"), RemoteVersionRange );
 	CachedJson->TryGetBoolField( TEXT("RequiredOnRemote"), bRequiredOnRemote );
-	CachedJson->TryGetStringArrayField(TEXT("ModAuthors"), ModAuthors);
-	if (ModAuthors.IsEmpty() && !CreatedBy.IsEmpty()) ModAuthors.Add(CreatedBy);
+	if (!CachedJson->TryGetStringArrayField(TEXT("ModAuthors"), ModAuthors) && !CreatedBy.IsEmpty()) ModAuthors.Add(CreatedBy);
 	CachedJson->TryGetStringField(TEXT("ModPageURL"), ModPageURL);
 	CachedJson->TryGetStringField(TEXT("ModEnvironment"), ModEnvironment);
 	CachedJson->TryGetStringField(TEXT("ModLoaderVersion"), ModLoaderVersion);
@@ -145,9 +144,6 @@ void UModMetadataObject::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
 {
 	UObject::PostEditChangeProperty(PropertyChangedEvent);
 	const FName Member = PropertyChangedEvent.MemberProperty ? PropertyChangedEvent.MemberProperty->GetFName() : PropertyChangedEvent.GetPropertyName();
-	if (Member == GET_MEMBER_NAME_CHECKED(UModMetadataObject, ModAuthors)) CreatedBy = FString::Join(ModAuthors, TEXT(", "));
-	else if (Member == GET_MEMBER_NAME_CHECKED(UModMetadataObject, CreatedBy))
-		ModAuthors = CreatedBy.IsEmpty() ? TArray<FString>() : TArray<FString>{CreatedBy};
 	if (Member == GET_MEMBER_NAME_CHECKED(UModMetadataObject, VersionName)) SemVersion = VersionName;
 	if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UModMetadataObject, SemVersion))
 	{

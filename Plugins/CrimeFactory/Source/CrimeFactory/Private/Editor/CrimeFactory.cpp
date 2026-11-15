@@ -14,8 +14,11 @@
 #include "ISettingsSection.h"
 #include "LevelEditor.h"
 #include "ToolMenus.h"
-#include "IPluginBrowser.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Widgets/SWindow.h"
+#include "Widgets/Layout/SBox.h"
 #include "ModCreation/ModWizardDefinition.h"
+#include "ModCreation/SCrimeFactoryCreateMod.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Engine/AssetManager.h"
@@ -175,7 +178,6 @@ void FCrimeFactoryModule::StartupModule() {
 }
 
 void FCrimeFactoryModule::ShutdownModule() {
-    IPluginManager::Get().OnNewPluginMounted().Remove(PluginMountedHandle);
     IPluginManager::Get().OnNewPluginContentMounted().Remove(PluginContentMountedHandle);
     CrimeFactoryMetadataSync::Shutdown();
     CrimeFactoryAssetPalette::Unregister();
@@ -209,8 +211,39 @@ void FCrimeFactoryModule::ShutdownModule() {
 
 TSharedRef<SDockTab> FCrimeFactoryModule::HandleSpawnModCreatorTab(const FSpawnTabArgs& SpawnTabArgs)
 {
-    IPluginBrowser& PluginBrowser = FModuleManager::Get().GetModuleChecked<IPluginBrowser>(TEXT("PluginBrowser"));
-    return PluginBrowser.SpawnPluginCreatorTab(SpawnTabArgs, MakeShared<FModWizardDefinition>());
+    TSharedRef<SDockTab> Tab = SNew(SDockTab).TabRole(ETabRole::NomadTab);
+    const auto Creator = SNew(SCrimeFactoryCreateMod, Tab);
+    ModCreatorWidget = Creator;
+    Tab->SetContent(SNew(SBox).MinDesiredWidth(820).MinDesiredHeight(560)[Creator]);
+    Tab->SetOnTabActivated(SDockTab::FOnTabActivatedCallback::CreateLambda([bInitialSizeApplied = false](TSharedRef<SDockTab> ActiveTab, ETabActivationCause) mutable
+    {
+        auto Window = FSlateApplication::Get().FindWidgetWindow(ActiveTab);
+        if (Window && Window != FGlobalTabmanager::Get()->GetRootWindow())
+        {
+            Window->SetSizeLimits(FWindowSizeLimits().SetMinWidth(820).SetMinHeight(560));
+            if (!bInitialSizeApplied)
+            {
+                // Only initialise a floating creation window. Docked editor tabs
+                // retain their host's size, and subsequent user resizing is kept.
+                const FVector2D Position = Window->GetPositionInScreen();
+                const FSlateRect WorkArea = FSlateApplication::Get().GetWorkArea(FSlateRect(Position, Position + Window->GetSizeInScreen()));
+                const float Scale = Window->GetDPIScaleFactor();
+                const FVector2D Size(FMath::Min(1280.0f * Scale, WorkArea.Right - WorkArea.Left - 64.0f),
+                    FMath::Min(960.0f * Scale, WorkArea.Bottom - WorkArea.Top - 64.0f));
+                Window->Resize(Size);
+                Window->MoveWindowTo(FVector2D(WorkArea.Left + (WorkArea.Right - WorkArea.Left - Size.X) * 0.5f,
+                    WorkArea.Top + (WorkArea.Bottom - WorkArea.Top - Size.Y) * 0.5f));
+                bInitialSizeApplied = true;
+            }
+        }
+    }));
+    return Tab;
+}
+
+void FCrimeFactoryModule::OpenModCreator(TFunction<void(IPlugin&)> OnCreated)
+{
+    if (FGlobalTabmanager::Get()->TryInvokeTab(ModCreatorTabName))
+        if (auto Creator = ModCreatorWidget.Pin()) Creator->SetOnCreated(MoveTemp(OnCreated));
 }
 
 void FCrimeFactoryModule::RegisterSettings() const {
@@ -732,11 +765,7 @@ void FCrimeFactoryModule::RegisterModTemplates()
                 RegisterPrimaryAssetLabelsFromPlugin(Plugin.Get());
         }
 
-        // Preserve existing support for project plugins providing templates.
-        if (IsPluginAMod(Plugin.Get()))
-        {
-            AddModTemplatesFromPlugin(Plugin.Get());
-        }
+
     }
 
     if (bAssetManagerChanged)
@@ -744,11 +773,6 @@ void FCrimeFactoryModule::RegisterModTemplates()
         SaveAndRefreshAssetManagerSettings();
     }
 
-    PluginMountedHandle = IPluginManager::Get().OnNewPluginMounted().AddLambda(
-        [this](IPlugin& Plugin)
-        {
-            if (IsPluginAMod(Plugin)) AddModTemplatesFromPlugin(Plugin);
-        });
     PluginContentMountedHandle = IPluginManager::Get().OnNewPluginContentMounted().AddLambda(
         [this](IPlugin& Plugin)
         {
@@ -756,52 +780,6 @@ void FCrimeFactoryModule::RegisterModTemplates()
             // PAL discovery must wait until the content mount is actually available.
             if (Plugin.GetType() == EPluginType::Mod) EnsureAssetManagerRegistrationForPlugin(Plugin);
         });
-}
-
-void FCrimeFactoryModule::AddModTemplatesFromPlugin(IPlugin& Plugin) {
-    FString TemplatesPath = Plugin.GetBaseDir() / TEXT("Templates");
-    if (!FPaths::DirectoryExists(TemplatesPath)) {
-        return;
-    }
-    FString TemplatesJSONPath = TemplatesPath / TEXT("templates.json");
-    if (!FPaths::FileExists(TemplatesJSONPath)) {
-        return;
-    }
-    FString TemplatesJSON;
-    if (!FFileHelper::LoadFileToString(TemplatesJSON, *TemplatesJSONPath)) {
-        return;
-    }
-    const TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(TemplatesJSON);
-    TSharedPtr<FJsonObject> TemplatesJSONObj;
-    if (!FJsonSerializer::Deserialize(JsonReader, TemplatesJSONObj)) {
-        UE_LOG(LogCrimeFactory, Error, TEXT("Invalid templates for mod %s: invalid json"), *Plugin.GetName());
-        return;
-    }
-
-    const TArray<TSharedPtr<FJsonValue>>* TemplatesArrayPtr;
-    if(!TemplatesJSONObj->TryGetArrayField(TEXT("templates"), TemplatesArrayPtr)) {
-        UE_LOG(LogCrimeFactory, Error, TEXT("Invalid templates for mod %s: \"templates\" not in json"), *Plugin.GetName());
-        return;
-    }
-    int i = 0;
-    for(TSharedPtr<FJsonValue> Item : *TemplatesArrayPtr)
-    {
-        i++;
-        const TSharedPtr<FJsonObject>* ItemObjPtr;
-        if(!Item->TryGetObject(ItemObjPtr)) {
-            UE_LOG(LogCrimeFactory, Error, TEXT("Invalid template for mod %s: template %d: not an object"), *Plugin.GetName(), i);
-            continue;
-        }
-
-        FString Error;
-        TSharedPtr<FModTemplateDescription> ModTemplate = FModTemplateDescription::Load(*ItemObjPtr, TemplatesPath, Error);
-        if(!ModTemplate.IsValid())
-        {
-            UE_LOG(LogCrimeFactory, Error, TEXT("Invalid templates for mod %s: template %d: %s"), *Plugin.GetName(), i, *Error);
-            continue;
-        }
-        ModTemplates.Add(ModTemplate.ToSharedRef());
-    }    
 }
 
 #undef LOCTEXT_NAMESPACE

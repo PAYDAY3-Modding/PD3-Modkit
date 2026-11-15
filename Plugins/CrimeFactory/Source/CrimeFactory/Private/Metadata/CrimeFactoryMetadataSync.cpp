@@ -198,10 +198,10 @@ namespace
         Result->SetStringField(TEXT("ModDescription"), Descriptor.Description);
         const TArray<TSharedPtr<FJsonValue>>* Authors;
         TArray<FString> AuthorNames;
+        // An explicit author array is independent of the descriptor's CreatedBy credit.
         if (Json->TryGetArrayField(TEXT("ModAuthors"), Authors))
             for (const auto& Author : *Authors) AuthorNames.Add(Author->AsString());
-        if (FString::Join(AuthorNames, TEXT(", ")) != Descriptor.CreatedBy)
-            AuthorNames = Descriptor.CreatedBy.IsEmpty() ? TArray<FString>() : TArray<FString>{Descriptor.CreatedBy};
+        else if (!Descriptor.CreatedBy.IsEmpty()) AuthorNames.Add(Descriptor.CreatedBy);
         // Preserve legacy multi-author arrays when their visible author string agrees.
         if (!Json->HasField(TEXT("ModAuthors")))
         {
@@ -332,13 +332,6 @@ namespace
                 Descriptor.VersionName = Text;
                 Descriptor.Version = FCString::Atoi(*Text);
                 Descriptor.AdditionalFieldsToWrite.Add(TEXT("SemVersion"), MakeShared<FJsonValueString>(Text));
-            }
-            else if (Key == TEXT("ModAuthors"))
-            {
-                TArray<FString> Authors;
-                Values.TryGetStringArrayField(Key, Authors);
-                Descriptor.CreatedBy = FString::Join(Authors, TEXT(", "));
-                SetExtra(Key, Key);
             }
             else SetExtra(Key, Key);
         }

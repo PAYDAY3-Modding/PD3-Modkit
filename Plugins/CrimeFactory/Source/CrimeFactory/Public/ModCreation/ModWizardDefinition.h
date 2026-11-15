@@ -3,11 +3,19 @@
 #include "IPluginWizardDefinition.h"
 
 struct FModTemplateDescription;
+class IPlugin;
+struct FPluginDescriptor;
 
 class FModWizardDefinition : public IPluginWizardDefinition
 {
 public:
 	FModWizardDefinition();
+	void RefreshTemplates();
+	TSharedPtr<IPlugin> CreateModFromSelection(const FString& Name, const FString& Destination, const FPluginDescriptor& Descriptor, bool bShowContent, FText& Error);
+	FString GetTemplatesDirectory() const { return PluginBaseDir / TEXT("Templates"); }
+	FText DiscoveryError;
+	FString IconOverridePath;
+	mutable bool bPostCreationSucceeded = false;
 
 	// Begin IPluginWizardDefinition interface
 	virtual const TArray<TSharedRef<FPluginTemplateDescription>>& GetTemplatesSource() const override;
@@ -69,7 +77,7 @@ struct FModTemplateDependency
 	{
 	}
 	
-	static TSharedPtr<FModTemplateDependency> Load(const TSharedPtr<FJsonObject> JSON, FString& Error);
+	
 };
 
 struct FModTemplateDescription
@@ -84,5 +92,5 @@ struct FModTemplateDescription
 	{
 	}
 	
-	static TSharedPtr<FModTemplateDescription> Load(const TSharedPtr<FJsonObject> JSON, const FString TemplatesPath, FString& Error);
+	static TSharedPtr<FModTemplateDescription> FromFolder(const FString& Folder);
 };

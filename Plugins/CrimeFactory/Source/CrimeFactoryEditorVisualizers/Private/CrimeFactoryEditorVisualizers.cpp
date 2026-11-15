@@ -3,6 +3,7 @@
 #include "ISettingsModule.h"
 #include "Engine/Engine.h"
 #include "Modules/ModuleManager.h"
+#include "Misc/CoreDelegates.h"
 
 #define LOCTEXT_NAMESPACE "CrimeFactoryEditorVisualizers"
 
@@ -23,23 +24,42 @@ public:
             GetMutableDefault<UCrimeFactoryActorVisualisationSettings>());
         Manager = MakeUnique<FCrimeFactoryBillboardManager>();
         Manager->Initialize();
+        bSettingsRegistered = true;
+        // Module shutdown runs after UObject teardown on normal editor exit.
+        // Release delegates and strong preview references while their owners live.
+        EnginePreExitHandle = FCoreDelegates::OnEnginePreExit.AddRaw(this,
+            &FCrimeFactoryEditorVisualizersModule::StopVisualizers);
     }
 
     virtual void ShutdownModule() override
+    {
+        FCoreDelegates::OnEnginePreExit.Remove(EnginePreExitHandle);
+        EnginePreExitHandle.Reset();
+        StopVisualizers();
+    }
+
+private:
+    /** Used by both engine pre-exit and an explicit module unload; safe to repeat. */
+    void StopVisualizers()
     {
         if (Manager)
         {
             Manager->Shutdown();
             Manager.Reset();
         }
-        if (ISettingsModule* Settings = FModuleManager::GetModulePtr<ISettingsModule>("Settings"))
+        if (bSettingsRegistered)
         {
-            Settings->UnregisterSettings("Project", "CrimeFactory", "ActorVisualisation");
+            bSettingsRegistered = false;
+            if (ISettingsModule* Settings = FModuleManager::GetModulePtr<ISettingsModule>("Settings"))
+            {
+                Settings->UnregisterSettings("Project", "CrimeFactory", "ActorVisualisation");
+            }
         }
     }
 
-private:
     TUniquePtr<FCrimeFactoryBillboardManager> Manager;
+    FDelegateHandle EnginePreExitHandle;
+    bool bSettingsRegistered = false;
 };
 
 IMPLEMENT_MODULE(FCrimeFactoryEditorVisualizersModule, CrimeFactoryEditorVisualizers)
