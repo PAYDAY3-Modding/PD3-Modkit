@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 0,
-	"VersionName": "EA_0.1.3",
+	"VersionName": "EA_0.1.6",
 	"FriendlyName": "PDML",
 	"Description": "A unified PAYDAY 3 mod loader and runtime for managing Blueprint mods, custom maps, HUD mods, and their assets.",
 	"Category": "Modding",
@@ -15,9 +15,9 @@
 	"IsExperimentalVersion": false,
 	"Installed": false,
 	"EnabledByDefault": true,
-	"SemVersion": "EA_0.1.3",
+	"SemVersion": "EA_0.1.6",
 	"RequiredOnRemote": false,
-	"ModPageURL": "",
+	"ModPageURL": "https://modworkshop.net/mod/59255",
 	"ModEnvironment": "",
 	"ModLoaderVersion": "",
 	"ModAuthors": [
